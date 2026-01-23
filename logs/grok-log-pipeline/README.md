@@ -6,6 +6,23 @@ This sandbox demonstrates how to create a Datadog log pipeline with a Grok proce
 
 The use case involves parsing logs from a service that generates alarm messages with a JSON payload containing status information, error messages, and submission IDs.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Minikube["Minikube Cluster"]
+        subgraph Node["Node"]
+            Pod["demo-log-generator&lt;br/&gt;(busybox)"]
+            Agent["Datadog Agent&lt;br/&gt;(DaemonSet)"]
+        end
+    end
+    
+    Pod -->|stdout| Agent
+    Agent -->|HTTPS| DD["Datadog Backend"]
+    DD --> Pipeline["Log Pipeline"]
+    Pipeline --> Explorer["Log Explorer"]
+```
+
 ## Environment
 
 - **Agent Version:** 7.74.0
