@@ -211,11 +211,11 @@ ALARM_SERVICE: workflow orchestration failed PAYLOAD: {'status': 'SUCCESS', 'err
 
 **Pipeline Overview:**
 
-![Pipeline Overview](screenshots/pipeline-overview.png)
+![Pipeline Overview](pipeline-overview.png)
 
 **Pipeline Processors:**
 
-![Pipeline Processors](screenshots/pipeline-processors-expanded.png)
+![Pipeline Processors](pipeline-processors-expanded.png)
 
 ## Expected Results
 
@@ -223,13 +223,13 @@ After the pipeline is configured and logs are being generated, you should see:
 
 ### Log Explorer View
 
-![Log Explorer](screenshots/log-explorer-final.png)
+![Log Explorer](log-explorer-final.png)
 
 ### Extracted Attributes
 
 When you click on a log entry, you should see the following extracted attributes in the details panel:
 
-![Extracted Attributes](screenshots/pipeline-log-details-extracted-attributes.png)
+![Extracted Attributes](pipeline-log-details-extracted-attributes.png)
 
 | Attribute | Example Value | Description |
 |-----------|---------------|-------------|
