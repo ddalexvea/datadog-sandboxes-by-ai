@@ -12,8 +12,8 @@ The use case involves parsing logs from a service that generates alarm messages 
 flowchart LR
     subgraph Minikube["Minikube Cluster"]
         subgraph Node["Node"]
-            Pod["demo-log-generator&lt;br/&gt;(busybox)"]
-            Agent["Datadog Agent&lt;br/&gt;(DaemonSet)"]
+            Pod["demo-log-generator"]
+            Agent["Datadog Agent"]
         end
     end
     
