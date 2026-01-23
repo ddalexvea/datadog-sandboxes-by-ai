@@ -2,7 +2,7 @@
 
 ## Context
 
-This sandbox demonstrates how to create a Datadog log pipeline with multiple Grok processors to extract custom attributes from structured log messages. It shows how to parse a JSON-like payload embedded in log messages and extract specific fields into searchable attributes.
+This sandbox demonstrates how to create a Datadog log pipeline with a Grok processor to extract custom attributes from structured log messages. It shows how to parse a JSON-like payload embedded in log messages using the `keyvalue` parser.
 
 The use case involves parsing logs from a service that generates alarm messages with a JSON payload containing status information, error messages, and submission IDs.
 
@@ -79,79 +79,46 @@ helm repo add datadog https://helm.datadoghq.com && helm repo update
 helm upgrade --install datadog-agent datadog/datadog -n datadog -f values.yaml
 ```
 
-### 5. Create the Log Pipeline via API
+### 5. Create the Log Pipeline
 
-The pipeline uses multiple Grok processors to:
-1. Extract the entire payload content into a `content` attribute
-2. Extract `status`, `error_message`, and `submission_id` from the content
+Navigate to **Logs > Configuration > Pipelines** in the Datadog UI and create a new pipeline with:
 
-```bash
-# Set your credentials
-export DD_API_KEY="your_api_key"
-export DD_APP_KEY="your_app_key"
-export DD_SITE="datadoghq.com"
+- **Name:** Service Alarm Pipeline
+- **Filter:** `ALARM_SERVICE`
+- **Processor:** Grok Parser with the pattern below
 
-# Create the pipeline
-curl -X POST "https://api.${DD_SITE}/api/v1/logs/config/pipelines" \
--H "Content-Type: application/json" \
--H "DD-API-KEY: ${DD_API_KEY}" \
--H "DD-APPLICATION-KEY: ${DD_APP_KEY}" \
--d '{
-  "name": "Service Alarm Pipeline",
-  "is_enabled": true,
-  "filter": {
-    "query": "ALARM_SERVICE"
-  },
-  "processors": [
-    {
-      "name": "Extract full content",
-      "is_enabled": true,
-      "source": "message",
-      "samples": [
-        "ALARM_SERVICE: workflow orchestration failed PAYLOAD: {\"status\": \"SUCCESS\", \"submission_id\": \"abc123\"}"
-      ],
-      "grok": {
-        "support_rules": "",
-        "match_rules": "myrule ALARM_SERVICE: workflow orchestration failed PAYLOAD: %{data:content}"
-      },
-      "type": "grok-parser"
-    },
-    {
-      "name": "Extract status from content",
-      "is_enabled": true,
-      "source": "content",
-      "samples": [],
-      "grok": {
-        "support_rules": "",
-        "match_rules": "statusrule .*'\''status'\'': '\''%{word:payload.status}'\''.*"
-      },
-      "type": "grok-parser"
-    },
-    {
-      "name": "Extract submission_id from content",
-      "is_enabled": true,
-      "source": "content",
-      "samples": [],
-      "grok": {
-        "support_rules": "",
-        "match_rules": "submissionidrule .*'\''submission_id'\'': '\''%{notSpace:payload.submission_id}'\''.*"
-      },
-      "type": "grok-parser"
-    },
-    {
-      "name": "Extract error_message from content",
-      "is_enabled": true,
-      "source": "content",
-      "samples": [],
-      "grok": {
-        "support_rules": "",
-        "match_rules": "errormessagerule .*'\''error_message'\'': '\''%{data:payload.error_message}'\''.*"
-      },
-      "type": "grok-parser"
-    }
-  ]
-}'
+## Pipeline Configuration
+
+### Overview
+
+The pipeline processes logs with the following structure:
+
 ```
+ALARM_SERVICE: workflow orchestration failed PAYLOAD: {'status': 'SUCCESS', 'error_message': 'Connection timeout to external API', 'submission_id': 'sub-1769191308-5608'}
+```
+
+### Grok Parser Processor
+
+**Name:** Extract full content
+
+**Source:** `message`
+
+**Pattern:**
+```
+ALARM_SERVICE: workflow orchestration failed PAYLOAD: %{data::keyvalue(": ")}
+```
+
+**How it works:**
+- The `%{data::keyvalue(": ")}` pattern uses the built-in keyvalue parser
+- It automatically extracts all key-value pairs from the JSON-like payload
+- Single-quoted strings are recognized and extracted as attributes
+- Each field becomes a searchable attribute without needing separate processors
+
+### Screenshots
+
+**Grok Parser Configuration:**
+
+![Grok Parser Configuration](grok-parser-configuration.png)
 
 ## Test Commands
 
@@ -175,44 +142,6 @@ kubectl logs demo-log-generator --tail=20
 # ALARM_SERVICE: workflow orchestration failed PAYLOAD: {'status': 'SUCCESS', 'error_message': 'Connection timeout to external API', 'submission_id': 'sub-1769191308-5608'}
 ```
 
-## Pipeline Configuration
-
-### Overview
-
-The pipeline is designed to handle logs with the following structure:
-
-```
-ALARM_SERVICE: workflow orchestration failed PAYLOAD: {'status': 'SUCCESS', 'error_message': 'Connection timeout to external API', 'submission_id': 'sub-1769191308-5608'}
-```
-
-### Processors
-
-1. **Extract full content** (Grok Parser)
-   - Source: `message`
-   - Pattern: `ALARM_SERVICE: workflow orchestration failed PAYLOAD: %{data:content}`
-   - Output: Creates a `content` attribute containing the entire JSON-like payload
-
-2. **Extract status** (Grok Parser)
-   - Source: `content`
-   - Pattern: `.*'status': '%{word:payload.status}'.*`
-   - Output: Creates `payload.status` attribute (e.g., "SUCCESS")
-
-3. **Extract submission_id** (Grok Parser)
-   - Source: `content`
-   - Pattern: `.*'submission_id': '%{notSpace:payload.submission_id}'.*`
-   - Output: Creates `payload.submission_id` attribute (e.g., "sub-1769191308-5608")
-
-4. **Extract error_message** (Grok Parser)
-   - Source: `content`
-   - Pattern: `.*'error_message': '%{data:payload.error_message}'.*`
-   - Output: Creates `payload.error_message` attribute (e.g., "Connection timeout to external API")
-
-### Screenshots
-
-**Grok Parser Configuration:**
-
-![Grok Parser Configuration](grok-parser-configuration.png)
-
 ## Expected Results
 
 After the pipeline is configured and logs are being generated, you should see:
@@ -227,10 +156,10 @@ When you click on a log entry, you should see the following extracted attributes
 
 ![Extracted Attributes](pipeline-log-details-extracted-attributes.png)
 
-| Attribute | Value | Description |
+| Attribute | Example Value | Description |
 |-----------|-------|-------------|
-| `error_message` | Connection | The error message extracted from the payload |
 | `status` | SUCCESS | The status of the operation |
+| `error_message` | Connection timeout to external API | The error message extracted from the payload |
 | `submission_id` | sub-1769191308-5608 | Unique identifier for the submission |
 
 ### Query Examples
@@ -239,13 +168,13 @@ You can now query your logs using the extracted attributes:
 
 ```
 # Find all logs with SUCCESS status
-ALARM_SERVICE status:SUCCESS
+ALARM_SERVICE @status:SUCCESS
 
 # Find logs with specific submission_id
-ALARM_SERVICE @payload.submission_id:sub-*
+ALARM_SERVICE @submission_id:sub-*
 
 # Find logs with connection errors
-ALARM_SERVICE @error_message:Connection*
+ALARM_SERVICE @error_message:*timeout*
 ```
 
 ## Troubleshooting
@@ -277,8 +206,8 @@ kubectl exec -n datadog daemonset/datadog-agent -c agent -- agent status | grep 
 
 2. **Attributes not extracted:**
    - Verify pipeline filter matches log query: `ALARM_SERVICE`
-   - Check Grok patterns in Pipeline Scanner (Datadog UI)
-   - Ensure log format matches the expected structure
+   - Check Grok pattern in Pipeline Scanner (Datadog UI)
+   - Ensure log format matches the expected structure with single quotes
 
 3. **Pipeline not processing logs:**
    - Check pipeline is enabled in Datadog UI
@@ -305,6 +234,7 @@ minikube delete
 - [Datadog Grok Parser](https://docs.datadoghq.com/logs/log_configuration/processors/?tab=ui#grok-parser)
 - [Datadog Log Pipelines](https://docs.datadoghq.com/logs/log_configuration/pipelines/)
 - [Grok Patterns](https://docs.datadoghq.com/logs/log_configuration/parsing/)
+- [Keyvalue Filter](https://docs.datadoghq.com/logs/log_configuration/parsing/#key-value-or-logfmt)
 - [Log Management](https://docs.datadoghq.com/logs/)
 - [Agent Docker Tags](https://hub.docker.com/r/datadog/agent/tags)
 - [Grok Debugger](https://grokdebugger.com/) - Online tool to test and validate Grok patterns
