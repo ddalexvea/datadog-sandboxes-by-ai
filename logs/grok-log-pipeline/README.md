@@ -144,7 +144,17 @@ kubectl logs demo-log-generator --tail=20
 
 ## Expected Results
 
-After the pipeline is configured and logs are being generated, you should see:
+### Before Pipeline (No Extracted Attributes)
+
+Without the pipeline enabled, logs are ingested but **no attributes are extracted** from the message. The Log Explorer shows:
+
+![Before - No Attributes Extracted](log-explorer-before-no-attributes.png)
+
+Notice: **"No attributes have been extracted from the log message"** - this is because the pipeline is not processing the logs yet.
+
+### After Pipeline (Attributes Extracted)
+
+After enabling the pipeline with the Grok parser, the same logs now have **extracted attributes** that can be searched and filtered:
 
 ### Log Explorer View
 
