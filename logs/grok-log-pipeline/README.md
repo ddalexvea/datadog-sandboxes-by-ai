@@ -213,10 +213,6 @@ ALARM_SERVICE: workflow orchestration failed PAYLOAD: {'status': 'SUCCESS', 'err
 
 ![Grok Parser Configuration](grok-parser-configuration.png)
 
-**Pipeline Processors:**
-
-![Pipeline Processors](pipeline-processors-expanded.png)
-
 ## Expected Results
 
 After the pipeline is configured and logs are being generated, you should see:
