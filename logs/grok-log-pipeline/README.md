@@ -123,7 +123,7 @@ curl -X POST "https://api.${DD_SITE}/api/v1/logs/config/pipelines" \
       "samples": [],
       "grok": {
         "support_rules": "",
-        "match_rules": "statusrule .*'\''status'\'' : '\''%{word:payload.status}'\''.*"
+        "match_rules": "statusrule .*'\''status'\'': '\''%{word:payload.status}'\''.*"
       },
       "type": "grok-parser"
     },
@@ -134,7 +134,7 @@ curl -X POST "https://api.${DD_SITE}/api/v1/logs/config/pipelines" \
       "samples": [],
       "grok": {
         "support_rules": "",
-        "match_rules": "submissionidrule .*'\''submission_id'\'' : '\''%{notSpace:payload.submission_id}'\''.*"
+        "match_rules": "submissionidrule .*'\''submission_id'\'': '\''%{notSpace:payload.submission_id}'\''.*"
       },
       "type": "grok-parser"
     },
@@ -145,7 +145,7 @@ curl -X POST "https://api.${DD_SITE}/api/v1/logs/config/pipelines" \
       "samples": [],
       "grok": {
         "support_rules": "",
-        "match_rules": "errormessagerule .*'\''error_message'\'' : '\''%{data:payload.error_message}'\''.*"
+        "match_rules": "errormessagerule .*'\''error_message'\'': '\''%{data:payload.error_message}'\''.*"
       },
       "type": "grok-parser"
     }
@@ -311,17 +311,3 @@ minikube delete
 - [Grok Patterns](https://docs.datadoghq.com/logs/log_configuration/parsing/)
 - [Log Management](https://docs.datadoghq.com/logs/)
 - [Agent Docker Tags](https://hub.docker.com/r/datadog/agent/tags)
-
-## Screenshots Location
-
-**Note:** Screenshots are located in the `screenshots/` folder. To add them to this repository:
-
-1. The screenshots were captured during the sandbox creation:
-   - `pipeline-overview.png` - Shows the pipeline in the Datadog UI
-   - `pipeline-processors-expanded.png` - Shows all processors expanded
-   - `log-explorer-final.png` - Shows logs in the Log Explorer
-   - `pipeline-log-details-extracted-attributes.png` - Shows extracted attributes
-
-2. Screenshots are available at: `/tmp/sandbox-screenshots/` on the system where this sandbox was created
-
-3. To add them, copy the PNG files to `logs/grok-log-pipeline/screenshots/` in this repository
