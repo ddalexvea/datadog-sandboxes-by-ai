@@ -327,9 +327,109 @@ MANIFEST
 
 ---
 
+## How to Identify Which Configuration Method is Used
+
+### Quick Identification Guide
+
+| Indicator | Method | Example |
+|-----------|--------|---------|
+| **Configuration provider:** `kubernetes-container-allinone` | Annotations | Pod has `ad.datadoghq.com/` annotations |
+| **Configuration source:** `container:docker://...` | Annotations | Source is a container ID |
+| **Configuration source:** `file:...configmap-conf.yaml` | ConfigMap | Custom filename in mount path |
+| **Configuration source:** `file:.../conf.d/redisdb.yaml` | Helm confd | File directly in conf.d/ |
+| **Configuration source:** `file:.../redisdb.d/auto_conf.yaml` | Auto-discovery | Built-in auto_conf.yaml |
+| **Tag:** `method:annotations` | Annotations | Custom tag we added |
+| **Tag:** `method:configmap` | ConfigMap | Custom tag we added |
+| **Tag:** `method:helm-confd` | Helm confd | Custom tag we added |
+| **Tag:** `method:operator-extraconfd` | Operator | Custom tag we added |
+
+### Detailed configcheck Output Examples
+
+#### Method 1: Annotations Output
+```
+=== redisdb check ===
+Configuration provider: kubernetes-container-allinone      <-- IDENTIFIES ANNOTATIONS
+Configuration source: container:docker://7c076b8d4380...  <-- Container ID, not file path
+Config for instance ID: redisdb:56674756a4f303
+host: 10.244.0.28
+port: "6379"
+tags:
+  - method:annotations    <-- Custom tag confirms method
+  - env:sandbox
+  - kube_namespace:sandbox
+  ...
+Auto-discovery IDs:
+* docker://7c076b8d4380...  <-- Docker container ID
+```
+
+#### Method 2: ConfigMap Output
+```
+=== redisdb check ===
+Configuration provider: file                               <-- File-based config
+Configuration source: file:/etc/datadog-agent/conf.d/redisdb.d/configmap-conf.yaml  <-- Custom mount path
+Config for instance ID: redisdb:d5ccd2641a9aa0ca
+host: 10.244.0.27
+port: "6379"
+tags:
+  - method:configmap      <-- Custom tag confirms method
+  - env:sandbox
+  ...
+Auto-discovery IDs:
+* redis                   <-- ad_identifiers value
+```
+
+#### Method 3: Helm confd Output
+```
+=== redisdb check ===
+Configuration provider: file
+Configuration source: file:/etc/datadog-agent/conf.d/redisdb.yaml  <-- Directly in conf.d/
+Config for instance ID: redisdb:6e30718fcc1794f4
+host: 10.244.0.26
+port: "6379"
+tags:
+  - method:helm-confd     <-- Custom tag confirms method
+  - env:sandbox
+  ...
+Auto-discovery IDs:
+* redis
+```
+
+#### Method 4: Operator extraConfd Output
+```
+=== redisdb check ===
+Configuration provider: file
+Configuration source: file:/etc/datadog-agent/conf.d/redisdb.yaml  <-- Same as Helm confd
+Config for instance ID: redisdb:93908787fd0f0ca6
+host: 10.244.0.28
+port: "6379"
+tags:
+  - method:operator-extraconfd  <-- Custom tag differentiates from Helm
+  - env:sandbox
+  ...
+Auto-discovery IDs:
+* redis
+```
+
+#### Auto-discovery Output (no custom config)
+```
+=== redisdb check ===
+Configuration provider: file
+Configuration source: file:/etc/datadog-agent/conf.d/redisdb.d/auto_conf.yaml  <-- Built-in auto_conf
+Config for instance ID: redisdb:d97f9b9d8608defe
+host: 10.244.0.26
+port: 6379                <-- Note: integer, not string
+tags:                     <-- NO custom method tag
+  - kube_namespace:sandbox
+  ...
+Auto-discovery IDs:
+* redis
+```
+
+---
+
 ## Verification Commands
 
-### Check all Redis configurations
+### Get Agent Pod Name
 
 ```bash
 # For Helm-deployed agent
@@ -338,34 +438,134 @@ POD=$(kubectl get pods -n datadog -l app=datadog-agent -o jsonpath='{.items[0].m
 # For Operator-deployed agent
 POD=$(kubectl get pods -n datadog -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
 
-# List all redisdb configurations
-kubectl exec -n datadog $POD -c agent -- agent configcheck | grep -A 20 "redisdb"
-
-# Check agent status for Redis checks
-kubectl exec -n datadog $POD -c agent -- agent status | grep -A 8 "redisdb"
-
-# Run Redis check manually
-kubectl exec -n datadog $POD -c agent -- agent check redisdb
+echo "Agent pod: $POD"
 ```
 
-### Verify configuration sources
+### Match Redis Pods to Configurations
 
 ```bash
-# Should show different sources for each method:
-# - container:docker://... = Annotations (Method 1)
-# - file:/etc/datadog-agent/conf.d/redisdb.d/configmap-conf.yaml = ConfigMap (Method 2)
-# - file:/etc/datadog-agent/conf.d/redisdb.yaml = Helm confd (Method 3)
-# - file:/etc/datadog-agent/conf.d/redisdb.yaml = Operator extraConfd (Method 4)
-# - file:/etc/datadog-agent/conf.d/redisdb.d/auto_conf.yaml = Auto-discovery
+# Get Redis pod IPs
+echo "=== Redis Pod IPs ==="
+kubectl get pods -n sandbox -o wide | grep redis
 
-kubectl exec -n datadog $POD -c agent -- agent configcheck | grep -E "Configuration source:|method:"
+# Get all Redis configurations with IPs
+echo ""
+echo "=== Redis Configurations by IP ==="
+kubectl exec -n datadog $POD -c agent -- agent configcheck 2>/dev/null | \
+  grep -E "=== redis|host: 10\.|method:|Configuration source:" | \
+  sed 's/^/  /'
 ```
 
-### List files in conf.d
+### Show Only Configuration Method Tags
 
 ```bash
-kubectl exec -n datadog $POD -c agent -- ls -la /etc/datadog-agent/conf.d/ | grep redis
+kubectl exec -n datadog $POD -c agent -- agent configcheck 2>/dev/null | \
+  grep -E "method:" | sort | uniq -c
 ```
+
+### Check Which Files Exist in conf.d
+
+```bash
+echo "=== Files in conf.d related to redis ==="
+kubectl exec -n datadog $POD -c agent -- find /etc/datadog-agent/conf.d -name "*redis*" -type f
+
+echo ""
+echo "=== Content of each file ==="
+for f in $(kubectl exec -n datadog $POD -c agent -- find /etc/datadog-agent/conf.d -name "*redis*" -type f); do
+  echo "--- $f ---"
+  kubectl exec -n datadog $POD -c agent -- cat "$f" 2>/dev/null | head -20
+  echo ""
+done
+```
+
+### Check Agent Status for Running Checks
+
+```bash
+echo "=== Redis Check Status ==="
+kubectl exec -n datadog $POD -c agent -- agent status 2>/dev/null | \
+  grep -A 10 "redisdb"
+```
+
+### Verify Template Variables Resolved
+
+```bash
+# Should show actual IPs instead of %%host%%
+kubectl exec -n datadog $POD -c agent -- agent configcheck 2>/dev/null | \
+  grep -E "host: [0-9]" | sort -u
+```
+
+---
+
+## Debugging: Why Is My Configuration Not Working?
+
+### Issue: Annotations not picked up
+
+**Check:**
+```bash
+# Verify annotation exists on pod
+kubectl get pod redis-annotations -n sandbox -o jsonpath='{.metadata.annotations}' | jq .
+
+# Check agent logs for annotation discovery
+kubectl logs -n datadog $POD -c agent | grep -i "annotation"
+```
+
+**Common causes:**
+- Annotation key typo (`ad.datadoghq.com/redis.checks` - container name must match)
+- Invalid JSON in annotation
+- Agent pod restarted before pod was discovered
+
+### Issue: ConfigMap not mounted
+
+**Check:**
+```bash
+# Verify ConfigMap exists
+kubectl get configmap redis-check-config -n datadog -o yaml
+
+# Check if file exists in agent
+kubectl exec -n datadog $POD -c agent -- ls -la /etc/datadog-agent/conf.d/redisdb.d/
+
+# Check agent pod volumes
+kubectl get pod $POD -n datadog -o jsonpath='{.spec.volumes}' | jq .
+```
+
+**Common causes:**
+- ConfigMap in wrong namespace
+- Volume mount path incorrect
+- subPath doesn't match ConfigMap key
+
+### Issue: Helm confd not applied
+
+**Check:**
+```bash
+# Verify Helm values
+helm get values datadog-agent -n datadog
+
+# Check file in agent
+kubectl exec -n datadog $POD -c agent -- cat /etc/datadog-agent/conf.d/redisdb.yaml
+```
+
+**Common causes:**
+- YAML indentation issues in values file
+- Agent pod not restarted after Helm upgrade
+
+### Issue: Duplicate checks running
+
+**Symptom:** Same Redis pod monitored multiple times
+
+**Check:**
+```bash
+kubectl exec -n datadog $POD -c agent -- agent configcheck 2>/dev/null | \
+  grep -E "host: 10.244" | sort | uniq -c
+```
+
+**Solution:** Disable auto-configuration:
+```yaml
+datadog:
+  ignoreAutoConfig:
+    - redisdb
+```
+
+---
 
 ## Expected vs Actual
 
@@ -387,25 +587,38 @@ From the documentation:
 
 > **Note:** If using both auto_conf.yaml and custom configuration for the same integration, you may need to disable auto-configuration with `datadog.ignoreAutoConfig: [redisdb]`.
 
-## Troubleshooting
+---
 
-```bash
-# Pod logs
-kubectl logs -n sandbox -l app=redis --tail=100
-kubectl logs -n datadog -l app.kubernetes.io/component=agent -c agent --tail=100
+## Log Messages to Look For
 
-# Describe pods
-kubectl describe pod -n datadog -l app.kubernetes.io/component=agent
+### Successful Autodiscovery
 
-# Check ConfigMap is mounted
-kubectl exec -n datadog $POD -c agent -- cat /etc/datadog-agent/conf.d/redisdb.d/configmap-conf.yaml
-
-# Debug autodiscovery
-kubectl exec -n datadog $POD -c agent -- agent status | grep -A 50 "Autodiscovery"
-
-# Check environment
-kubectl exec -n datadog $POD -c agent -- env | grep DD_
 ```
+# In agent logs
+kubernetes-container-allinone provider: collected 1 new configurations
+```
+
+### Configuration Loaded from File
+
+```
+file provider: collected 67 new configurations
+```
+
+### Check Running Successfully
+
+```
+check:redisdb | Running check...
+check:redisdb | Done running check
+```
+
+### Template Variable Resolution
+
+```
+# Look for resolved IPs in logs
+host: 10.244.0.28
+```
+
+---
 
 ## Cleanup
 
