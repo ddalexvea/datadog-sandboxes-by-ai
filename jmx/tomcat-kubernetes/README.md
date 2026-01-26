@@ -1,43 +1,75 @@
 # JMX Integration - Tomcat on Kubernetes
 
-## Overview
+## Context
 
-This sandbox demonstrates JMX metric collection from a Tomcat application running in Kubernetes using the Datadog Agent with JMXFetch.
+This sandbox demonstrates JMX metric collection from a Tomcat application running in Kubernetes using the Datadog Agent with JMXFetch. It reproduces common JMX connectivity issues, particularly the `java.rmi.server.hostname` misconfiguration that causes "Connection refused to host: 0.0.0.0" errors.
 
 **Use Case:** Troubleshooting JMX connectivity issues in Kubernetes environments.
 
-## Prerequisites
+## Environment
 
-- Minikube or Kubernetes cluster
-- Helm 3.x
-- `kubectl` configured
-- Datadog API key
+- **Agent Version:** 7.74.x (with `-jmx` tag)
+- **Platform:** minikube / Kubernetes
+- **Integration:** JMX / Tomcat
+- **Java Version:** OpenJDK 11
 
-## Setup
+## Schema
+
+```mermaid
+graph TB
+    subgraph "Kubernetes Cluster"
+        subgraph "sandbox namespace"
+            TOMCAT[Pod: tomcat-jmx<br/>Tomcat 9 + JDK 11<br/>JMX Port: 9012]
+        end
+        
+        subgraph "datadog namespace"
+            AGENT[DaemonSet: datadog-agent<br/>Agent 7.x-jmx<br/>JMXFetch]
+            DCA[Deployment: cluster-agent]
+        end
+    end
+    
+    AGENT -->|"JMX RMI<br/>port 9012"| TOMCAT
+    AGENT -->|"Autodiscovery<br/>annotations"| TOMCAT
+    DCA -->|"Cluster checks"| AGENT
+    AGENT -->|"Metrics via<br/>DogStatsD"| DD[(Datadog)]
+    
+    style TOMCAT fill:#f9f,stroke:#333
+    style AGENT fill:#9cf,stroke:#333
+    style DCA fill:#9cf,stroke:#333
+```
+
+**Key Points:**
+- JMXFetch (embedded in agent) connects to Tomcat via RMI on port 9012
+- `java.rmi.server.hostname` must be set to Pod IP (not 0.0.0.0)
+- Agent uses autodiscovery annotations to detect JMX configuration
+
+## Quick Start
 
 ### 1. Start Minikube
 
 ```bash
+minikube delete --all
 minikube start --memory=4096 --cpus=2
 minikube status
 ```
 
-### 2. Create Namespace
-
-```bash
-kubectl create namespace sandbox
-```
-
-### 3. Deploy Tomcat with JMX Enabled
+### 2. Deploy Tomcat with JMX Enabled
 
 **⚠️ Critical:** The `java.rmi.server.hostname` must be set to the Pod IP, NOT `0.0.0.0` or `localhost`.
 
 ```bash
-kubectl apply -n sandbox -f - <<'EOF'
+kubectl apply -f - <<'MANIFEST'
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sandbox
+---
 apiVersion: v1
 kind: Pod
 metadata:
   name: tomcat-jmx
+  namespace: sandbox
   labels:
     app: tomcat-jmx
   annotations:
@@ -75,16 +107,19 @@ spec:
       requests:
         memory: "512Mi"
         cpu: "250m"
-EOF
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
+MANIFEST
 ```
 
-### 4. Wait for Pod Ready
+### 3. Wait for Pod Ready
 
 ```bash
 kubectl wait --for=condition=ready pod -n sandbox -l app=tomcat-jmx --timeout=120s
 ```
 
-### 5. Deploy Datadog Agent
+### 4. Deploy Datadog Agent
 
 ```bash
 kubectl create namespace datadog
@@ -103,11 +138,31 @@ helm upgrade --install datadog-agent datadog/datadog -n datadog \
 
 ## Test Commands
 
-### Agent Status
+### Agent
 
 ```bash
 kubectl exec -n datadog daemonset/datadog-agent -c agent -- agent status | grep -A 30 "JMX Fetch"
+kubectl exec -n datadog daemonset/datadog-agent -c agent -- agent jmx list everything
+kubectl exec -n datadog daemonset/datadog-agent -c agent -- agent check tomcat
 ```
+
+### Other
+
+```bash
+# Verify JMX is listening on Tomcat
+kubectl logs -n sandbox tomcat-jmx | grep -i "jmxremote"
+
+# Get Pod IP to verify hostname config
+kubectl get pod tomcat-jmx -n sandbox -o jsonpath='{.status.podIP}'
+```
+
+## Expected vs Actual
+
+| Behavior | Expected | Actual |
+|----------|----------|--------|
+| JMX Connection | ✅ OK | ✅ OK |
+| Metric Count | ✅ 28+ metrics | ✅ 28 metrics |
+| Autodiscovery | ✅ Detects tomcat | ✅ Detects tomcat |
 
 ### Expected Output (Working)
 
@@ -124,27 +179,7 @@ JMX Fetch
       status: OK
 ```
 
-### JMX List Beans
-
-```bash
-kubectl exec -n datadog daemonset/datadog-agent -c agent -- agent jmx list everything
-```
-
-### Check Tomcat Logs
-
-```bash
-kubectl logs -n sandbox tomcat-jmx | grep -i jmx
-```
-
-## Expected vs Actual
-
-| Behavior | Expected | Actual |
-|----------|----------|--------|
-| JMX Connection | ✅ OK | ✅ OK |
-| Metric Count | ✅ 28+ metrics | ✅ 28 metrics |
-| Autodiscovery | ✅ Detects tomcat | ✅ Detects tomcat |
-
-## Common Issues Reproduced
+## Fix / Workaround
 
 ### Issue 1: Connection Refused to 0.0.0.0
 
@@ -154,9 +189,7 @@ Connection refused to host: 0.0.0.0; nested exception is:
 java.net.ConnectException: Connection refused
 ```
 
-**Cause:** `java.rmi.server.hostname=0.0.0.0` instead of Pod IP.
-
-**Fix:** Use `$(POD_IP)` environment variable:
+**Fix:** Use Pod IP via environment variable:
 ```yaml
 env:
 - name: POD_IP
@@ -171,15 +204,11 @@ env:
 
 **Symptom:** No JMX Fetch section in agent status.
 
-**Cause:** Agent deployed without JMX support.
-
 **Fix:** Add `--set agents.image.tagSuffix=jmx` to Helm install.
 
 ### Issue 3: Wrong Port in Autodiscovery
 
 **Symptom:** Connection timeout or refused.
-
-**Cause:** Annotation port doesn't match JMX port.
 
 **Fix:** Ensure annotation port matches `-Dcom.sun.management.jmxremote.port`:
 ```yaml
@@ -193,15 +222,21 @@ annotations:
 ```bash
 # Pod logs
 kubectl logs -n sandbox tomcat-jmx --tail=100
-
-# Agent logs
 kubectl logs -n datadog -l app=datadog-agent -c agent --tail=100
 
 # Describe pod
 kubectl describe pod -n sandbox tomcat-jmx
+kubectl describe pod -n datadog -l app=datadog-agent
+
+# Get events
+kubectl get events -n sandbox --sort-by='.lastTimestamp'
 
 # Check JMX connectivity from agent
 kubectl exec -n datadog daemonset/datadog-agent -c agent -- agent jmx list everything --checks tomcat
+
+# Check resources
+kubectl get pods -n sandbox -o wide
+kubectl get pods -n datadog -o wide
 ```
 
 ## Cleanup
