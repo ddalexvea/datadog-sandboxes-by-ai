@@ -146,7 +146,67 @@ kubectl exec -n datadog daemonset/datadog-agent -c agent -- agent jmx list every
 kubectl exec -n datadog daemonset/datadog-agent -c agent -- agent check tomcat
 ```
 
-### Other
+### JMXTerm - Interactive JMX Diagnostics
+
+[JMXTerm](https://github.com/jiaqi/jmxterm) is a CLI tool to explore JMX beans interactively. Use it to verify JMX connectivity independently of the Datadog Agent.
+
+```bash
+# Get Pod IP
+POD_IP=$(kubectl get pod tomcat-jmx -n sandbox -o jsonpath='{.status.podIP}')
+
+# Download and run JMXTerm from agent container
+kubectl exec -n datadog daemonset/datadog-agent -c agent -- bash -c "
+curl -sL https://github.com/jiaqi/jmxterm/releases/download/v1.0.1/jmxterm-1.0.1-uber.jar -o /tmp/jmxterm.jar
+java -jar /tmp/jmxterm.jar -l $POD_IP:9012
+"
+```
+
+**JMXTerm Commands:**
+```
+# List available domains
+$> domains
+
+# Select a domain
+$> domain Catalina
+
+# List beans in current domain
+$> beans
+
+# Get info about a specific bean
+$> info Catalina:type=ThreadPool,name="http-nio-8080"
+
+# Get a specific attribute
+$> get -b Catalina:type=ThreadPool,name="http-nio-8080" currentThreadCount
+```
+
+**Example Output (Working):**
+```
+$ echo 'domains' | java -jar /tmp/jmxterm.jar -l 10.244.0.53:9012 -n
+Welcome to JMX terminal. Type "help" for available commands.
+Catalina
+JMImplementation
+Users
+com.sun.management
+java.lang
+java.nio
+java.util.logging
+jdk.management.jfr
+```
+
+**Example: List Catalina Beans:**
+```
+$ echo 'domain Catalina
+beans' | java -jar /tmp/jmxterm.jar -l 10.244.0.53:9012 -n
+
+#domain = Catalina:
+Catalina:name="http-nio-8080",type=GlobalRequestProcessor
+Catalina:name="http-nio-8080",type=ThreadPool
+Catalina:port=8080,type=Connector
+Catalina:type=Server
+...
+```
+
+### Other Verification Commands
 
 ```bash
 # Verify JMX is listening on Tomcat
@@ -163,6 +223,7 @@ kubectl get pod tomcat-jmx -n sandbox -o jsonpath='{.status.podIP}'
 | JMX Connection | ✅ OK | ✅ OK |
 | Metric Count | ✅ 28+ metrics | ✅ 28 metrics |
 | Autodiscovery | ✅ Detects tomcat | ✅ Detects tomcat |
+| JMXTerm domains | ✅ Lists domains | ✅ Lists domains |
 
 ### Expected Output (Working)
 
@@ -189,6 +250,13 @@ Connection refused to host: 0.0.0.0; nested exception is:
 java.net.ConnectException: Connection refused
 ```
 
+**Diagnose with JMXTerm:**
+```bash
+# This will fail if hostname is misconfigured
+java -jar /tmp/jmxterm.jar -l $POD_IP:9012
+# Error: Connection refused
+```
+
 **Fix:** Use Pod IP via environment variable:
 ```yaml
 env:
@@ -209,6 +277,13 @@ env:
 ### Issue 3: Wrong Port in Autodiscovery
 
 **Symptom:** Connection timeout or refused.
+
+**Diagnose with JMXTerm:**
+```bash
+# Test the port directly
+java -jar /tmp/jmxterm.jar -l $POD_IP:WRONG_PORT
+# Error: Connection refused
+```
 
 **Fix:** Ensure annotation port matches `-Dcom.sun.management.jmxremote.port`:
 ```yaml
@@ -237,6 +312,13 @@ kubectl exec -n datadog daemonset/datadog-agent -c agent -- agent jmx list every
 # Check resources
 kubectl get pods -n sandbox -o wide
 kubectl get pods -n datadog -o wide
+
+# Interactive JMX debugging with JMXTerm
+POD_IP=$(kubectl get pod tomcat-jmx -n sandbox -o jsonpath='{.status.podIP}')
+kubectl exec -it -n datadog daemonset/datadog-agent -c agent -- bash -c "
+curl -sL https://github.com/jiaqi/jmxterm/releases/download/v1.0.1/jmxterm-1.0.1-uber.jar -o /tmp/jmxterm.jar
+java -jar /tmp/jmxterm.jar -l $POD_IP:9012
+"
 ```
 
 ## Cleanup
@@ -251,5 +333,8 @@ kubectl delete namespace datadog
 
 - [Autodiscovery with JMX](https://docs.datadoghq.com/containers/guide/autodiscovery-with-jmx/)
 - [JMX Integration](https://docs.datadoghq.com/integrations/java/)
+- [Creating a JMX Integration - JMXTerm](https://docs.datadoghq.com/developers/guide/creating-a-jmx-integration/#jmxterm)
+- [JMXTerm GitHub](https://github.com/jiaqi/jmxterm)
+- [JMXFetch GitHub](https://github.com/DataDog/jmxfetch)
 - [Troubleshooting JMXFetch](https://datadoghq.atlassian.net/wiki/spaces/TS/pages/328437488) (internal)
 - [Agent Docker Tags](https://hub.docker.com/r/datadog/agent/tags)
