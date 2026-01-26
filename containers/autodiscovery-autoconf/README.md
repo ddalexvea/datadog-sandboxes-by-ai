@@ -11,7 +11,7 @@ This sandbox tests:
 
 ## Environment
 
-- **Agent Version:** 7.60.1
+- **Agent Version:** Latest (Helm chart default)
 - **Platform:** minikube / Kubernetes
 - **Integrations:** Redis, CoreDNS
 
@@ -146,10 +146,6 @@ datadog:
 
 clusterAgent:
   enabled: true
-
-agents:
-  image:
-    tag: 7.60.1
 ```
 
 Install the agent:
@@ -226,10 +222,6 @@ datadog:
 
 clusterAgent:
   enabled: true
-
-agents:
-  image:
-    tag: 7.60.1
 ```
 
 Apply the change:
@@ -260,10 +252,10 @@ kubectl exec -n datadog daemonset/datadog-agent -c agent -- agent configcheck | 
 
 | Scenario | Expected | Actual |
 |----------|----------|--------|
-| Default auto-conf for redis-default | ✅ Redis check auto-configured | |
-| Custom annotations for redis-custom | ✅ Custom tags applied | |
-| DD_IGNORE_AUTOCONF=redisdb | ✅ redis-ignored not monitored | |
-| Annotations override DD_IGNORE_AUTOCONF | ✅ redis-custom still monitored | |
+| Default auto-conf for redis-default | ✅ Redis check auto-configured | ✅ Verified |
+| Custom annotations for redis-custom | ✅ Custom tags applied | ✅ `custom:override`, `env:sandbox` present |
+| DD_IGNORE_AUTOCONF=redisdb | ✅ redis-ignored not monitored | ✅ Only redis-custom in configcheck |
+| Annotations override DD_IGNORE_AUTOCONF | ✅ redis-custom still monitored | ✅ Verified |
 
 ## Additional Tests: CoreDNS Auto-configuration
 
