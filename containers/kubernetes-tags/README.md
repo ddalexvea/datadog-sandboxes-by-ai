@@ -193,7 +193,7 @@ datadog:
     # "*": "pod_annotation_%%annotation%%"
   
   # 3. Node Labels as Tags
-  # Converts node labels to Datadog tags (applied to all pods on that node)
+  # Converts node labels to Datadog tags (applied as host tags)
   nodeLabelsAsTags:
     "custom-node-label": node_custom_label
     "node-type": node_type
@@ -202,7 +202,7 @@ datadog:
     # "*": "node_label_%%label%%"
   
   # 4. Namespace Labels as Tags
-  # Converts namespace labels to Datadog tags
+  # Converts namespace labels to Datadog tags (applied to all pods in namespace)
   namespaceLabelsAsTags:
     team: namespace_team
     environment: namespace_env
@@ -304,6 +304,11 @@ datadog:
 DD_KUBERNETES_NODE_LABELS_AS_TAGS='{"topology.kubernetes.io/region":"region"}'
 ```
 
+**Verification:** Node labels appear as **host tags** in `agent status`:
+```bash
+kubectl exec -n datadog $POD -c agent -- agent status | grep -A 10 "host tags:"
+```
+
 ---
 
 ### Method 4: Namespace Labels as Tags
@@ -321,6 +326,11 @@ datadog:
 **Equivalent Environment Variable:**
 ```bash
 DD_KUBERNETES_NAMESPACE_LABELS_AS_TAGS='{"team":"namespace_team"}'
+```
+
+**Verification:** Namespace labels appear in `tagger-list` for pods in that namespace:
+```bash
+kubectl exec -n datadog $POD -c agent -- agent tagger-list | grep "namespace_team"
 ```
 
 ---
@@ -387,36 +397,40 @@ kubectl exec -n datadog $POD -c agent -- agent config 2>/dev/null | grep -E "lab
 
 echo ""
 echo "=========================================="
-echo "2. LIST ALL DISCOVERED TAGS (tagger-list)"
+echo "2. VERIFY NODE LABELS AS HOST TAGS"
+echo "=========================================="
+kubectl exec -n datadog $POD -c agent -- agent status 2>/dev/null | grep -A 10 "host tags:"
+
+echo ""
+echo "=========================================="
+echo "3. VERIFY NAMESPACE LABELS AS TAGS"
+echo "=========================================="
+kubectl exec -n datadog $POD -c agent -- agent tagger-list 2>/dev/null | tr ' ' '\n' | grep -E "namespace_" | sort -u
+
+echo ""
+echo "=========================================="
+echo "4. VERIFY POD LABELS AS TAGS"
 echo "=========================================="
 echo "--- Tags for app-with-labels ---"
 kubectl exec -n datadog $POD -c agent -- agent tagger-list 2>/dev/null | grep -A 3 "pod_name:app-with-labels" | grep "=Tags:" | head -1
 
 echo ""
+echo "=========================================="
+echo "5. VERIFY POD ANNOTATIONS AS TAGS"
+echo "=========================================="
 echo "--- Tags for app-with-annotations ---"
 kubectl exec -n datadog $POD -c agent -- agent tagger-list 2>/dev/null | grep -A 3 "pod_name:app-with-annotations" | grep "=Tags:" | head -1
 
 echo ""
-echo "--- Tags for app-with-env (container level) ---"
+echo "=========================================="
+echo "6. VERIFY CONTAINER ENV VARS AS TAGS"
+echo "=========================================="
 kubectl exec -n datadog $POD -c agent -- agent tagger-list 2>/dev/null | grep -E "service_name:|datacenter:" | head -1
 
 echo ""
 echo "=========================================="
-echo "3. SPECIFIC TAG VERIFICATION"
+echo "7. VERIFY DIRECT TAG INJECTION"
 echo "=========================================="
-echo "Pod Labels as Tags:"
-kubectl exec -n datadog $POD -c agent -- agent tagger-list 2>/dev/null | grep -oE "kube_app:[a-zA-Z0-9-]+" | sort -u
-
-echo ""
-echo "Pod Annotations as Tags:"
-kubectl exec -n datadog $POD -c agent -- agent tagger-list 2>/dev/null | grep -oE "kube_annotation_[a-z_]+:[a-zA-Z0-9-]+" | sort -u
-
-echo ""
-echo "Container Env Vars as Tags:"
-kubectl exec -n datadog $POD -c agent -- agent tagger-list 2>/dev/null | grep -oE "(service_name|service_version|datacenter):[a-zA-Z0-9.-]+" | sort -u
-
-echo ""
-echo "Direct Injection (ad.datadoghq.com/tags):"
 kubectl exec -n datadog $POD -c agent -- agent tagger-list 2>/dev/null | grep -oE "source:[a-zA-Z0-9-]+" | sort -u
 ```
 
@@ -427,13 +441,19 @@ kubectl exec -n datadog $POD -c agent -- agent tagger-list 2>/dev/null | grep -o
 | `agent tagger-list` | Shows all tags discovered for each entity (pods, containers) |
 | `agent config` | Shows running configuration including all tag extraction settings |
 | `agent workload-list` | Shows workload metadata discovered by the agent |
-| `agent status` | Shows overall agent status |
+| `agent status` | Shows overall agent status including **host tags** (node labels) |
 
 ```bash
 POD=$(kubectl get pods -n datadog -l app=datadog-agent -o jsonpath='{.items[0].metadata.name}')
 
 # Full tagger list
 kubectl exec -n datadog $POD -c agent -- agent tagger-list
+
+# Check host tags (includes node labels)
+kubectl exec -n datadog $POD -c agent -- agent status | grep -A 10 "host tags:"
+
+# Check namespace labels in tagger
+kubectl exec -n datadog $POD -c agent -- agent tagger-list | grep "namespace_"
 
 # Check specific configuration
 kubectl exec -n datadog $POD -c agent -- agent config | grep -A 5 "kubernetes_pod_labels_as_tags"
@@ -453,12 +473,27 @@ kubectl exec -n datadog $POD -c agent -- env | grep -E "LABELS_AS_TAGS|ANNOTATIO
 | Pod Annotations | `app-with-annotations` | `kube_annotation_owner` | `platform-team` | ✅ |
 | Pod Annotations | `app-with-annotations` | `kube_annotation_cost_center` | `cc-98765` | ✅ |
 | Pod Annotations | `app-with-annotations` | `prometheus_scrape` | `true` | ✅ |
+| Node Labels | host tags | `node_custom_label` | `my-custom-value` | ✅ |
+| Node Labels | host tags | `node_type` | `worker` | ✅ |
+| Node Labels | host tags | `node_region` | `us-west-2` | ✅ |
+| Namespace Labels | sandbox pods | `namespace_team` | `platform` | ✅ |
+| Namespace Labels | sandbox pods | `namespace_env` | `testing` | ✅ |
+| Namespace Labels | sandbox pods | `namespace_cost_center` | `cc-12345` | ✅ |
 | Container Env | `app-with-env` | `service_name` | `payment-service` | ✅ |
 | Container Env | `app-with-env` | `service_version` | `2.0.0` | ✅ |
 | Container Env | `app-with-env` | `datacenter` | `us-east-1` | ✅ |
 | Direct Injection | `app-with-labels` | `source` | `annotations-tag` | ✅ |
-| Node Labels | (all pods) | `node_custom_label` | `my-custom-value` | ✅ (configured) |
-| Namespace Labels | (sandbox ns) | `namespace_team` | `platform` | ✅ (configured) |
+
+## Where Tags Appear
+
+| Tag Source | Where to Find | Command |
+|------------|---------------|---------|
+| Pod Labels | `tagger-list` (pod entity) | `agent tagger-list \| grep kube_app` |
+| Pod Annotations | `tagger-list` (pod entity) | `agent tagger-list \| grep kube_annotation` |
+| Node Labels | `agent status` (host tags) | `agent status \| grep "host tags:" -A 10` |
+| Namespace Labels | `tagger-list` (pod entity) | `agent tagger-list \| grep namespace_` |
+| Container Env | `tagger-list` (container entity) | `agent tagger-list \| grep service_name` |
+| Direct Injection | `tagger-list` (pod entity) | `agent tagger-list \| grep source:` |
 
 ## Configuration Precedence
 
@@ -488,6 +523,13 @@ When the same tag key is set by multiple sources, the following precedence appli
    ```bash
    kubectl exec -n datadog $POD -c agent -- agent tagger-list | grep "app-with-labels"
    ```
+
+### Node Labels Not in tagger-list
+
+Node labels appear as **host tags**, not in tagger-list. Check with:
+```bash
+kubectl exec -n datadog $POD -c agent -- agent status | grep -A 10 "host tags:"
+```
 
 ### Container Env Tags Not Showing at Pod Level
 
