@@ -2,6 +2,26 @@
 
 This sandbox reproduces the issue of deploying Datadog Agents on a mixed AWS EKS cluster (Linux + Windows nodes) and demonstrates the CRD conflict resolution using separate namespaces.
 
+## 🚀 One-Command Deployment
+
+```bash
+# Download and run the automated script
+curl -fsSL https://raw.githubusercontent.com/ddalexvea/datadog-sandboxes-by-ai/main/kubernetes/eks-mixed-cluster/deploy-eks-mixed-cluster.sh | \
+  AWS_PROFILE=sso-tse-sandbox-account-admin DD_API_KEY=your-api-key bash
+```
+
+Or clone and run locally:
+
+```bash
+export AWS_PROFILE="sso-tse-sandbox-account-admin"
+export DD_API_KEY="your-datadog-api-key"
+bash deploy-eks-mixed-cluster.sh
+```
+
+**Time:** ~30-40 minutes | **Cost:** ~$0.27/hour
+
+---
+
 ## Context
 
 When deploying Datadog Agents to a mixed EKS cluster with both Linux and Windows nodes, users encounter a Helm CustomResourceDefinition (CRD) ownership conflict if attempting to deploy two separate Helm releases **in the same namespace**. This sandbox demonstrates the problem and the recommended solution using AWS EKS infrastructure.
@@ -17,7 +37,7 @@ into the current release: invalid ownership metadata
 ## Environment
 
 | Component | Version/Details |
-|-----------|-----------------|
+|-----------|--------------------|
 | **AWS Service** | EKS (Elastic Kubernetes Service) |
 | **Kubernetes** | 1.31+ |
 | **Linux Nodes** | Amazon Linux 2, t3.medium |
@@ -26,6 +46,7 @@ into the current release: invalid ownership metadata
 | **Datadog Agent** | 7.x |
 | **Region** | us-east-1 (configurable) |
 | **Authentication** | AWS Vault |
+| **AWS Profile** | sso-tse-sandbox-account-admin |
 
 **Commands to verify:**
 
@@ -34,10 +55,10 @@ into the current release: invalid ownership metadata
 aws-vault list
 
 # Get cluster info
-aws-vault exec $AWS_PROFILE -- kubectl cluster-info
+aws-vault exec sso-tse-sandbox-account-admin -- kubectl cluster-info
 
 # List nodes
-aws-vault exec $AWS_PROFILE -- kubectl get nodes -o wide
+aws-vault exec sso-tse-sandbox-account-admin -- kubectl get nodes -o wide
 ```
 
 ## Architecture
@@ -70,10 +91,10 @@ AWS EKS Cluster (dd-mixed-cluster-repro)
 ### 0. Authenticate with AWS Vault
 
 ```bash
-# Set AWS profile (adjust as needed)
+# Set AWS profile
 export AWS_PROFILE=sso-tse-sandbox-account-admin
 
-# Login to AWS SSO
+# Login to AWS SSO (opens browser)
 aws-vault login $AWS_PROFILE
 
 # Verify credentials
@@ -335,6 +356,7 @@ aws-vault exec $AWS_PROFILE -- aws eks list-clusters --region us-east-1
 ## Notes
 
 - **AWS Vault Required:** This sandbox uses AWS Vault for credential management. Ensure it's configured with your AWS account access.
+- **AWS Profile:** Use `sso-tse-sandbox-account-admin` (verified working profile)
 - **Region Configuration:** Commands default to `us-east-1`. Change `--region` parameter for other regions.
 - **Cost Awareness:** EKS charges per cluster + EC2 instance costs. Delete cluster when not in use.
 - **Windows Node Wait Time:** Windows nodes take significantly longer to provision (~10+ minutes).
