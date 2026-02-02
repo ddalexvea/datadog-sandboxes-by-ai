@@ -4,7 +4,7 @@
 
 ## Context
 
-When deploying Datadog Agents to a mixed Kubernetes cluster with both Linux and Windows nodes using Helm, a CustomResourceDefinition (CRD) ownership conflict occurs if attempting to deploy two separate Helm releases in the same namespace. This sandbox demonstrates the CRD conflict and provides **two solutions**: separate namespaces (recommended) and same namespace with `--skip-crds` (simpler).
+When deploying Datadog Agents to a mixed Kubernetes cluster with both Linux and Windows nodes using Helm, a CustomResourceDefinition (CRD) ownership conflict occurs if attempting to deploy two separate Helm releases in the same namespace. This sandbox demonstrates the CRD conflict and the recommended solution using separate namespaces with cross-namespace Cluster Agent connectivity.
 
 **Error:** 
 ```
@@ -71,10 +71,6 @@ graph TB
 
 ## Quick Start
 
-**Two deployment options available:**
-- **Option 1 (Recommended):** Separate namespaces - Better isolation
-- **Option 2 (Simpler):** Same namespace with `--skip-crds` - Less complexity
-
 ### 1. Start EKS Cluster
 
 ```bash
@@ -124,13 +120,7 @@ aws-vault exec $AWS_PROFILE -- kubectl get nodes -o wide
 
 ### 4. Deploy Datadog Agent
 
-Choose your deployment option:
-
----
-
-## OPTION 1: Separate Namespaces (Recommended)
-
-### 4a. Create namespaces and secrets
+Create namespaces and secrets:
 
 ```bash
 # Add Helm repo
@@ -150,7 +140,7 @@ kubectl create secret generic datadog-secret \
   -n datadog-windows
 ```
 
-### 4b. Create values-linux.yaml
+Create `values-linux.yaml`:
 
 ```yaml
 datadog:
@@ -177,7 +167,7 @@ datadog-crds:
     datadogMetrics: true  # Linux release owns CRDs
 ```
 
-### 4c. Create values-windows.yaml
+Create `values-windows.yaml`:
 
 ```yaml
 datadog:
@@ -206,16 +196,18 @@ datadog-crds:
     datadogMetrics: false  # CRITICAL: Disable to prevent conflict
 ```
 
-### 4d. Install releases
+Install Linux release (FIRST - owns CRDs):
 
 ```bash
-# Linux release FIRST (owns CRDs)
 helm install datadog-linux datadog/datadog \
   --namespace datadog-linux \
   --values values-linux.yaml \
   --wait --timeout 10m
+```
 
-# Windows release SECOND (connects to Linux CA)
+Install Windows release (SECOND - connects to Linux CA):
+
+```bash
 helm install datadog-windows datadog/datadog \
   --namespace datadog-windows \
   --values values-windows.yaml \
@@ -223,84 +215,18 @@ helm install datadog-windows datadog/datadog \
   --wait --timeout 10m
 ```
 
----
-
-## OPTION 2: Same Namespace with --skip-crds (Simpler)
-
-### 4a. Create namespace and secret
-
-```bash
-# Add Helm repo
-helm repo add datadog https://helm.datadoghq.com
-helm repo update
-
-# Create single namespace and secret
-kubectl create namespace datadog
-kubectl create secret generic datadog-secret \
-  --from-literal=api-key=YOUR_API_KEY \
-  -n datadog
-```
-
-### 4b. Deploy Linux release (owns CRDs)
-
-```bash
-helm install datadog-linux datadog/datadog \
-  --namespace datadog \
-  --set datadog.site=datadoghq.com \
-  --set datadog.apiKeyExistingSecret=datadog-secret \
-  --set datadog.clusterName=mixed-cluster-repro \
-  --set targetSystem=linux \
-  --set clusterAgent.enabled=true \
-  --set agents.nodeSelector."kubernetes\.io/os"=linux \
-  --set clusterAgent.nodeSelector."kubernetes\.io/os"=linux \
-  --set datadog-crds.crds.datadogMetrics=true \
-  --wait --timeout 10m
-```
-
-### 4c. Deploy Windows release (skips CRDs)
-
-```bash
-helm install datadog-windows datadog/datadog \
-  --namespace datadog \
-  --set datadog.site=datadoghq.com \
-  --set datadog.apiKeyExistingSecret=datadog-secret \
-  --set datadog.clusterName=mixed-cluster-repro \
-  --set targetSystem=windows \
-  --set clusterAgent.enabled=false \
-  --set existingClusterAgent.join=true \
-  --set existingClusterAgent.serviceName=datadog-linux-cluster-agent \
-  --set existingClusterAgent.tokenSecretName=datadog-linux-cluster-agent-token \
-  --set agents.nodeSelector."kubernetes\.io/os"=windows \
-  --skip-crds \
-  --wait --timeout 10m
-```
-
-### Option Comparison
-
-| Aspect | Option 1: Separate Namespaces | Option 2: Same Namespace |
-|--------|-------------------------------|-------------------------|
-| **Complexity** | Higher | Lower |
-| **Isolation** | Better | Same release namespace |
-| **DNS** | Cross-namespace | Simple service name |
-| **Secrets** | Two secrets | One secret |
-| **RBAC** | Cross-namespace permissions | Simpler |
-| **Cleanup** | Delete two namespaces | Delete one namespace |
-| **Best For** | Production, strict isolation | Testing, simplicity |
-
----
-
 ## Test Commands
 
 ### Agent Status
 
 ```bash
-# Linux Agent status (adjust namespace if using Option 2)
+# Linux Agent status
 kubectl exec -n datadog-linux daemonset/datadog-agent -c agent -- agent status
 
 # Cluster Agent status
 kubectl exec -n datadog-linux deployment/datadog-cluster-agent -- agent status
 
-# Windows Agent status (adjust namespace if using Option 2)
+# Windows Agent status (PowerShell)
 kubectl exec -n datadog-windows <windows-pod-name> -- powershell -c "& 'C:\Program Files\Datadog\Datadog Agent\bin\agent.exe' status"
 ```
 
@@ -312,19 +238,15 @@ kubectl get crd datadogdashboards.datadoghq.com -o yaml | grep "meta.helm.sh/rel
 
 # Expected output:
 # meta.helm.sh/release-name: datadog-linux
-# meta.helm.sh/release-namespace: datadog-linux (or datadog if Option 2)
+# meta.helm.sh/release-namespace: datadog-linux
 ```
 
-### Verify Connectivity
+### Verify Cross-Namespace Connectivity
 
 ```bash
-# Option 1: Test cross-namespace connectivity
+# Test Windows agent can reach Linux Cluster Agent
 kubectl exec -n datadog-windows <windows-pod-name> -- \
   powershell -c "Test-NetConnection datadog-linux-cluster-agent.datadog-linux -Port 5005"
-
-# Option 2: Test same-namespace connectivity
-kubectl exec -n datadog <windows-pod-name> -- \
-  powershell -c "Test-NetConnection datadog-linux-cluster-agent -Port 5005"
 
 # Check connection status
 kubectl logs -n datadog-windows <windows-pod-name> | grep "Cluster Agent"
@@ -334,23 +256,22 @@ kubectl logs -n datadog-windows <windows-pod-name> | grep "Cluster Agent"
 
 | Behavior | Expected | Actual |
 |----------|----------|--------|
-| **CRD Ownership** | ✅ datadog-linux only | ❌ Conflict if same namespace without --skip-crds |
+| **CRD Ownership** | ✅ datadog-linux only | ❌ Conflict if same namespace |
 | **Linux Agent** | ✅ Running on Linux nodes | ✅ Running |
 | **Windows Agent** | ✅ Running on Windows nodes | ✅ Running |
 | **Cluster Agent** | ✅ Running in Linux namespace | ✅ Running |
-| **Connectivity** | ✅ Windows → Linux CA | ✅ Connected |
+| **Cross-namespace DNS** | ✅ Windows → Linux CA | ✅ Connected |
 | **Helm Releases** | ✅ Two separate releases | ✅ datadog-linux + datadog-windows |
 
 ### Issue Reproduction
 
-**Attempt deploying Windows release in SAME namespace WITHOUT --skip-crds (reproduces error):**
+**Attempt deploying Windows release in SAME namespace (reproduces error):**
 
 ```bash
 # This will FAIL with CRD conflict:
 helm install datadog-windows datadog/datadog \
   --namespace datadog-linux \
-  --set targetSystem=windows \
-  --set clusterAgent.enabled=false
+  --values values-windows.yaml
 
 # Error output:
 # Error: unable to continue with install: CustomResourceDefinition exists 
@@ -359,42 +280,40 @@ helm install datadog-windows datadog/datadog \
 
 ## Fix / Workaround
 
-**Two solutions available:**
+**Solution: Use separate namespaces**
 
-### Solution 1: Separate Namespaces (Recommended)
+1. **Deploy Linux release FIRST** (owns CRDs, runs Cluster Agent)
+   - Namespace: `datadog-linux`
+   - Sets: `datadog-crds.crds.datadogMetrics=true`
+   - Sets: `clusterAgent.enabled=true`
 
-1. Deploy Linux release in `datadog-linux` namespace (owns CRDs)
-2. Deploy Windows release in `datadog-windows` namespace
-3. Use cross-namespace DNS: `serviceName.namespace.svc.cluster.local`
+2. **Deploy Windows release SECOND** (connects to Linux CA)
+   - Namespace: `datadog-windows`
+   - Sets: `datadog-crds.crds.datadogMetrics=false`
+   - Sets: `existingClusterAgent.join=true`
+   - Flag: `--skip-crds` during install
 
-**Pros:** Better isolation, clear separation of concerns  
-**Cons:** Slightly more complex networking
+3. **Cross-namespace DNS**: Windows agents connect to Linux Cluster Agent via:
+   ```
+   datadog-linux-cluster-agent.datadog-linux.svc.cluster.local:5005
+   ```
 
-### Solution 2: Same Namespace with --skip-crds
-
-1. Deploy Linux release in `datadog` namespace (owns CRDs)
-2. Deploy Windows release in same `datadog` namespace with `--skip-crds` flag
-3. Simple service DNS: `serviceName`
-
-**Pros:** Simpler networking, easier secret management  
-**Cons:** Less isolation between releases
-
-**Key Configuration (both options):**
+**Key Configuration:**
 
 ```yaml
 # Windows values.yaml
 existingClusterAgent:
   join: true
-  serviceName: datadog-linux-cluster-agent  # Add .namespace for Option 1
-  tokenSecretName: datadog-linux-cluster-agent-token
+  serviceName: datadog-linux-cluster-agent  # Service in Linux namespace
+  tokenSecretName: datadog-linux-cluster-agent-token  # Token from Linux namespace
 ```
 
 ## Troubleshooting
 
 ```bash
 # Check pod status
-kubectl get pods -n datadog-linux  # or -n datadog for Option 2
-kubectl get pods -n datadog-windows  # or -n datadog for Option 2
+kubectl get pods -n datadog-linux
+kubectl get pods -n datadog-windows
 
 # Describe pods
 kubectl describe pod -n datadog-linux -l app=datadog-agent
@@ -419,18 +338,12 @@ helm list -A | grep datadog
 kubectl get svc -n datadog-linux
 kubectl get endpoints -n datadog-linux
 
-# Test DNS resolution (Option 1)
+# Test cross-namespace DNS
 kubectl run -n datadog-windows test-dns --image=busybox --rm -it --restart=Never -- \
   nslookup datadog-linux-cluster-agent.datadog-linux.svc.cluster.local
-
-# Test DNS resolution (Option 2)
-kubectl run -n datadog test-dns --image=busybox --rm -it --restart=Never -- \
-  nslookup datadog-linux-cluster-agent
 ```
 
 ## Cleanup
-
-### Option 1: Separate Namespaces
 
 ```bash
 # Uninstall Helm releases
@@ -440,22 +353,7 @@ helm uninstall datadog-linux -n datadog-linux
 # Delete namespaces
 kubectl delete namespace datadog-linux
 kubectl delete namespace datadog-windows
-```
 
-### Option 2: Same Namespace
-
-```bash
-# Uninstall Helm releases
-helm uninstall datadog-windows -n datadog
-helm uninstall datadog-linux -n datadog
-
-# Delete namespace
-kubectl delete namespace datadog
-```
-
-### Delete EKS Cluster
-
-```bash
 # Delete EKS cluster (WARNING: Deletes all resources)
 eksctl delete cluster --name mixed-cluster-repro --region us-east-1
 ```
