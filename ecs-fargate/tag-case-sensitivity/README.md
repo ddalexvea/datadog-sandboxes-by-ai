@@ -10,7 +10,7 @@ This sandbox reproduces a critical tagging issue in AWS ECS Fargate where:
 2. **Docker labels and `DD_TAGS` cannot override** auto-discovered tags, causing duplicate tag values
 3. **Case sensitivity** in AWS cluster names (CamelCase) conflicts with custom lowercase tags
 
-**Customer Impact:**
+**Impact:**
 - Metrics split across multiple tag values
 - Dashboards show incomplete data
 - Monitors may not trigger correctly
@@ -23,14 +23,13 @@ This sandbox reproduces a critical tagging issue in AWS ECS Fargate where:
 - **Agent Version:** 7.75.1
 - **Platform:** AWS ECS Fargate
 - **AWS Region:** us-east-1
-- **Issue:** Ticket #2486556
 
 ## Schema
 
 ```mermaid
 graph TB
     subgraph "AWS ECS"
-        ECS[ECS Cluster: SelectTvTest<br/>CamelCase from AWS]
+        ECS[ECS Cluster: MyCluster<br/>CamelCase from AWS]
         META[Task Metadata API v4]
         TASK[Fargate Task]
     end
@@ -42,14 +41,14 @@ graph TB
     end
     
     subgraph "Configuration"
-        LABELS[Docker Labels:<br/>cluster_name: selecttvtest]
-        DDTAGS[DD_TAGS:<br/>cluster_name: selecttvtest]
+        LABELS[Docker Labels:<br/>cluster_name: mycluster]
+        DDTAGS[DD_TAGS:<br/>cluster_name: mycluster]
     end
     
     subgraph "Result"
-        AUTO1[ecs_cluster_name: SelectTvTest<br/>✅ Documented]
-        AUTO2[cluster_name: SelectTvTest<br/>❌ NOT Documented]
-        CUSTOM[cluster_name: selecttvtest<br/>❌ Doesn't Override]
+        AUTO1[ecs_cluster_name: MyCluster<br/>✅ Documented]
+        AUTO2[cluster_name: MyCluster<br/>❌ NOT Documented]
+        CUSTOM[cluster_name: mycluster<br/>❌ Doesn't Override]
     end
     
     ECS --> META
@@ -92,7 +91,7 @@ export AWS_PROFILE='your-aws-profile'
 # Optional (defaults shown)
 export DD_SITE="datadoghq.com"
 export AWS_REGION="us-east-1"
-export CLUSTER_NAME="SelectTvTest"
+export CLUSTER_NAME="MyCluster"
 ```
 
 ### 3. Deploy ECS Fargate Task
@@ -104,15 +103,15 @@ aws-vault exec $AWS_PROFILE -- bash << 'DEPLOY_SCRIPT'
 # Get AWS Account ID
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
-# Create ECS Cluster (CamelCase name)
+# Create ECS Cluster (CamelCase name to reproduce the issue)
 aws ecs create-cluster \
-  --cluster-name ${CLUSTER_NAME:-SelectTvTest} \
+  --cluster-name ${CLUSTER_NAME:-MyCluster} \
   --region ${AWS_REGION:-us-east-1} \
   --capacity-providers FARGATE \
   --default-capacity-provider-strategy capacityProvider=FARGATE,weight=1
 
 # Create Task Definition
-cat > task-definition.json <<EOF
+cat > task-definition.json <<TASKDEF
 {
   "family": "ecs-tag-test",
   "networkMode": "awsvpc",
@@ -135,7 +134,7 @@ cat > task-definition.json <<EOF
         },
         {
           "name": "DD_TAGS",
-          "value": "env:test,cluster:selecttvtest,cluster_name:selecttvtest"
+          "value": "env:test,cluster:mycluster,cluster_name:mycluster"
         }
       ],
       "logConfiguration": {
@@ -154,7 +153,7 @@ cat > task-definition.json <<EOF
       "essential": false,
       "command": ["sh", "-c", "while true; do echo 'Running...'; sleep 30; done"],
       "dockerLabels": {
-        "com.datadoghq.tags.cluster_name": "selecttvtest"
+        "com.datadoghq.tags.cluster_name": "mycluster"
       },
       "logConfiguration": {
         "logDriver": "awslogs",
@@ -168,7 +167,7 @@ cat > task-definition.json <<EOF
     }
   ]
 }
-EOF
+TASKDEF
 
 # Register Task Definition
 TASK_ARN=$(aws ecs register-task-definition \
@@ -200,7 +199,7 @@ SG_ID=$(aws ec2 describe-security-groups \
 
 # Run Task
 TASK_ID=$(aws ecs run-task \
-  --cluster ${CLUSTER_NAME:-SelectTvTest} \
+  --cluster ${CLUSTER_NAME:-MyCluster} \
   --task-definition $TASK_ARN \
   --launch-type FARGATE \
   --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_ID],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" \
@@ -212,7 +211,7 @@ echo "Task ARN: $TASK_ID"
 
 # Wait for task to start
 aws ecs wait tasks-running \
-  --cluster ${CLUSTER_NAME:-SelectTvTest} \
+  --cluster ${CLUSTER_NAME:-MyCluster} \
   --tasks $TASK_ID \
   --region ${AWS_REGION:-us-east-1}
 
@@ -241,7 +240,7 @@ aws logs tail /ecs/tag-test --follow --region us-east-1
 
 # Check task status
 aws ecs describe-tasks \
-  --cluster SelectTvTest \
+  --cluster MyCluster \
   --tasks TASK_ARN \
   --region us-east-1 \
   --include TAGS
@@ -260,8 +259,8 @@ curl -X GET "https://api.${DD_SITE}/api/v1/query?from=$(date -u -v-10M +%s)&to=$
 
 | Behavior | Expected | Actual |
 |----------|----------|--------|
-| `ecs_cluster_name` tag | ✅ `SelectTvTest` (documented) | ✅ `SelectTvTest` |
-| `cluster_name` tag | ✅ `selecttvtest` (custom from DD_TAGS) | ❌ **BOTH** `SelectTvTest` (auto) AND `selecttvtest` (custom) |
+| `ecs_cluster_name` tag | ✅ `MyCluster` (documented) | ✅ `MyCluster` |
+| `cluster_name` tag | ✅ `mycluster` (custom from DD_TAGS) | ❌ **BOTH** `MyCluster` (auto) AND `mycluster` (custom) |
 | Docker labels override | ✅ Should override auto-discovered tags | ❌ Creates duplicate tags instead |
 | Documentation | ✅ Lists all auto-discovered tags | ❌ Missing `cluster_name` from docs |
 
@@ -270,17 +269,17 @@ curl -X GET "https://api.${DD_SITE}/api/v1/query?from=$(date -u -v-10M +%s)&to=$
 **Metrics Explorer showing split streams:**
 
 ```
-Series 1: cluster_name:SelectTvTest   (CamelCase, auto-discovered)
-Series 2: cluster_name:selecttvtest   (lowercase, custom tags)
+Series 1: cluster_name:MyCluster   (CamelCase, auto-discovered)
+Series 2: cluster_name:mycluster   (lowercase, custom tags)
 ```
 
 **Observed Tags:**
 ```yaml
-ecs_cluster_name: SelectTvTest        # ✅ Documented
-cluster_name: SelectTvTest            # ❌ NOT documented!
-cluster_name: selecttvtest            # ❌ Doesn't override
+ecs_cluster_name: MyCluster        # ✅ Documented
+cluster_name: MyCluster            # ❌ NOT documented!
+cluster_name: mycluster            # ❌ Doesn't override
 env: test
-cluster: selecttvtest
+cluster: mycluster
 ```
 
 ## Fix / Workaround
@@ -292,18 +291,18 @@ Don't try to override `cluster_name`. Use a custom tag name instead:
 ```json
 {
   "name": "DD_TAGS",
-  "value": "env:qa,custom_cluster:selecttvtest,logical_cluster:selecttvtest"
+  "value": "env:qa,custom_cluster:mycluster,logical_cluster:mycluster"
 }
 ```
 
-Then update queries to use `custom_cluster:selecttvtest`.
+Then update queries to use `custom_cluster:mycluster`.
 
 ### Workaround 2: Match AWS Cluster Name Case
 
 Rename your AWS ECS cluster to lowercase:
 
 ```bash
-aws ecs create-cluster --cluster-name selecttvtest
+aws ecs create-cluster --cluster-name mycluster
 ```
 
 This avoids case mismatch but requires infrastructure change.
@@ -319,7 +318,7 @@ Remove custom `cluster_name` tags and use the auto-discovered value in all queri
 }
 ```
 
-Query with `cluster_name:SelectTvTest` (CamelCase).
+Query with `cluster_name:MyCluster` (CamelCase).
 
 ## Root Cause Analysis
 
@@ -350,20 +349,20 @@ if task.ClusterName != "" {
 **Missing from Docs:**
 - `cluster_name` ❌ (auto-discovered but not documented!)
 
-This leads customers to believe they can use `cluster_name` as a custom tag.
+This leads users to believe they can use `cluster_name` as a custom tag.
 
 ## Troubleshooting
 
 ```bash
 # Check cluster
-aws ecs describe-clusters --clusters SelectTvTest --region us-east-1
+aws ecs describe-clusters --clusters MyCluster --region us-east-1
 
 # List tasks
-aws ecs list-tasks --cluster SelectTvTest --region us-east-1
+aws ecs list-tasks --cluster MyCluster --region us-east-1
 
 # Task details
 aws ecs describe-tasks \
-  --cluster SelectTvTest \
+  --cluster MyCluster \
   --tasks TASK_ARN \
   --region us-east-1 \
   --include TAGS
@@ -379,7 +378,7 @@ aws logs tail /ecs/tag-test \
 
 # Get events
 aws ecs describe-tasks \
-  --cluster SelectTvTest \
+  --cluster MyCluster \
   --tasks TASK_ARN \
   --region us-east-1 \
   --query 'tasks[0].stoppedReason'
@@ -390,7 +389,7 @@ aws ecs describe-tasks \
 ```bash
 export AWS_PROFILE=your-aws-profile
 export AWS_REGION=us-east-1
-export CLUSTER_NAME=SelectTvTest
+export CLUSTER_NAME=MyCluster
 
 aws-vault exec $AWS_PROFILE -- bash << 'CLEANUP'
 # Stop tasks
@@ -420,11 +419,9 @@ CLEANUP
 
 ## References
 
-- **Zendesk Ticket:** #2486556
 - **Datadog AWS Fargate Docs:** https://docs.datadoghq.com/integrations/aws-fargate/?tab=webui#out-of-the-box-tags
 - **Agent Source Code:** [workloadmeta_extract.go](https://github.com/DataDog/datadog-agent/blob/main/comp/core/tagger/collectors/workloadmeta_extract.go#L465-L467)
 - **ECS Task Metadata Endpoint:** https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-metadata-endpoint-v4.html
-- **Related Issue:** Ticket #2441362 (AWS Batch Fargate tagging)
 
 ## Documentation Issues Identified
 
