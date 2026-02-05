@@ -1,1 +1,521 @@
-[{"text": "# Network Path on ECS Fargate - AWS Sandbox\n\n**Note:** All configurations are included inline in this README for easy copy-paste reproduction. Never put API keys directly in manifests - use environment variables or AWS Secrets Manager.\n\n## Context\n\nThis sandbox demonstrates Datadog Network Path monitoring on AWS ECS Fargate. Network Path provides traceroute-like visibility for network connections, helping diagnose connectivity issues and understand network topology between your infrastructure and external services.\n\n**Key capabilities proven:**\n- \u2705 Network Path works on ECS Fargate (despite limited kernel access)\n- \u2705 System-probe operates in eBPFless mode (required for Fargate)\n- \u2705 Scheduled path tests to external destinations\n- \u2705 Hop-by-hop latency and packet loss visibility\n\n## Environment\n\n- **Agent Version:** 7.73.0+ (Network Path support)\n- **Platform:** AWS ECS Fargate\n- **Region:** us-east-1 (configurable)\n- **Task Resources:** 0.5 vCPU, 1GB RAM\n\n**Commands to get versions:**\n```bash\n# Get task definition details\naws ecs describe-task-definition --task-definition fargate-netpath-demo --region us-east-1\n\n# Check agent version in logs\naws logs tail /ecs/fargate-netpath/datadog-agent --region us-east-1 --since 5m | grep \"version\"\n```\n\n## Schema\n\n```mermaid\ngraph TB\n    subgraph \"ECS Fargate Task\"\n        A[config-init<br/>busybox] -->|Creates configs| B\n        B[datadog-agent<br/>+ system-probe<br/>+ Network Path]\n        C[nginx-app<br/>:80]\n    end\n    \n    B -->|Traceroute Tests| D[8.8.8.8<br/>Google DNS]\n    B -->|Traceroute Tests| E[api.datadoghq.com<br/>Datadog API]\n    B -->|Traceroute Tests| F[1.1.1.1<br/>Cloudflare DNS]\n    B -->|Network Path Data| G[Datadog Platform]\n    \n    style B fill:#632ca6\n    style G fill:#632ca6\n    style A fill:#ff9900\n    style C fill:#4CAF50\n    style D fill:#2196F3\n    style E fill:#2196F3\n    style F fill:#2196F3\n```\n\n## Quick Start\n\n### 1. Set environment variables\n\n```bash\nexport AWS_PROFILE=\"your-aws-profile\"  # Your AWS profile\nexport AWS_REGION=\"us-east-1\"\nexport DD_API_KEY=\"your_datadog_api_key_here\"\nexport DD_SITE=\"datadoghq.com\"  # or datadoghq.eu, us3.datadoghq.com, etc.\n```\n\n### 2. Create task definition\n\nSave the following to `task-definition.json`:\n\n```bash\ncat > task-definition.json <<'EOF'\n{\n  \"family\": \"fargate-netpath-demo\",\n  \"networkMode\": \"awsvpc\",\n  \"requiresCompatibilities\": [\"FARGATE\"],\n  \"cpu\": \"512\",\n  \"memory\": \"1024\",\n  \"executionRoleArn\": \"arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsTaskExecutionRole\",\n  \"containerDefinitions\": [\n    {\n      \"name\": \"nginx-app\",\n      \"image\": \"nginx:alpine\",\n      \"essential\": true,\n      \"cpu\": 128,\n      \"memory\": 256,\n      \"portMappings\": [\n        {\n          \"containerPort\": 80,\n          \"protocol\": \"tcp\"\n        }\n      ],\n      \"logConfiguration\": {\n        \"logDriver\": \"awslogs\",\n        \"options\": {\n          \"awslogs-group\": \"/ecs/fargate-netpath/nginx\",\n          \"awslogs-region\": \"us-east-1\",\n          \"awslogs-stream-prefix\": \"nginx\",\n          \"awslogs-create-group\": \"true\"\n        }\n      },\n      \"dockerLabels\": {\n        \"com.datadoghq.tags.env\": \"sandbox\",\n        \"com.datadoghq.tags.service\": \"nginx-netpath-demo\",\n        \"com.datadoghq.tags.version\": \"1.0\"\n      }\n    },\n    {\n      \"name\": \"datadog-agent\",\n      \"image\": \"public.ecr.aws/datadog/agent:latest\",\n      \"essential\": true,\n      \"cpu\": 256,\n      \"memory\": 512,\n      \"environment\": [\n        {\"name\": \"DD_API_KEY\", \"value\": \"YOUR_DD_API_KEY\"},\n        {\"name\": \"DD_SITE\", \"value\": \"datadoghq.com\"},\n        {\"name\": \"ECS_FARGATE\", \"value\": \"true\"},\n        {\"name\": \"DD_ENV\", \"value\": \"sandbox\"},\n        {\"name\": \"DD_SERVICE\", \"value\": \"fargate-netpath-demo\"},\n        {\"name\": \"DD_TAGS\", \"value\": \"env:sandbox project:network-path-poc\"},\n        {\"name\": \"DD_SYSTEM_PROBE_ENABLED\", \"value\": \"true\"},\n        {\"name\": \"DD_SYSTEM_PROBE_NETWORK_ENABLED\", \"value\": \"true\"},\n        {\"name\": \"DD_NETWORK_CONFIG_ENABLE_EBPFLESS\", \"value\": \"true\"},\n        {\"name\": \"DD_TRACEROUTE_ENABLED\", \"value\": \"true\"},\n        {\"name\": \"DD_NETWORK_PATH_CONNECTIONS_MONITORING_ENABLED\", \"value\": \"false\"},\n        {\"name\": \"DD_SYSTEM_PROBE_CONFIG\", \"value\": \"/etc/datadog-agent-system-probe/system-probe.yaml\"},\n        {\"name\": \"DD_LOG_LEVEL\", \"value\": \"info\"}\n      ],\n      \"logConfiguration\": {\n        \"logDriver\": \"awslogs\",\n        \"options\": {\n          \"awslogs-group\": \"/ecs/fargate-netpath/datadog-agent\",\n          \"awslogs-region\": \"us-east-1\",\n          \"awslogs-stream-prefix\": \"datadog-agent\",\n          \"awslogs-create-group\": \"true\"\n        }\n      },\n      \"mountPoints\": [\n        {\"sourceVolume\": \"system-probe-config\", \"containerPath\": \"/etc/datadog-agent-system-probe\", \"readOnly\": false},\n        {\"sourceVolume\": \"network-path-config\", \"containerPath\": \"/etc/datadog-agent/conf.d/network_path.d\", \"readOnly\": false}\n      ]\n    },\n    {\n      \"name\": \"config-init\",\n      \"image\": \"busybox:latest\",\n      \"essential\": false,\n      \"command\": [\n        \"sh\", \"-c\",\n        \"mkdir -p /system-probe-config && printf 'system_probe_config:\\\\n  enabled: true\\\\n  debug_port: 0\\\\ntraceroute:\\\\n  enabled: true\\\\n' > /system-probe-config/system-probe.yaml && mkdir -p /network-path-config && printf 'init_config:\\\\n\\\\ninstances:\\\\n  - hostname: 8.8.8.8\\\\n    port: 443\\\\n    protocol: TCP\\\\n    min_collection_interval: 300\\\\n    tags:\\\\n      - destination:google-dns\\\\n      - test:connectivity\\\\n  - hostname: api.datadoghq.com\\\\n    port: 443\\\\n    protocol: TCP\\\\n    min_collection_interval: 300\\\\n    tags:\\\\n      - destination:datadog-intake\\\\n      - test:monitoring\\\\n  - hostname: 1.1.1.1\\\\n    port: 443\\\\n    protocol: TCP\\\\n    min_collection_interval: 300\\\\n    tags:\\\\n      - destination:cloudflare-dns\\\\n      - test:connectivity\\\\n' > /network-path-config/conf.yaml && echo 'Configuration files created successfully' && cat /system-probe-config/system-probe.yaml && cat /network-path-config/conf.yaml\"\n      ],\n      \"mountPoints\": [\n        {\"sourceVolume\": \"network-path-config\", \"containerPath\": \"/network-path-config\", \"readOnly\": false},\n        {\"sourceVolume\": \"system-probe-config\", \"containerPath\": \"/system-probe-config\", \"readOnly\": false}\n      ],\n      \"logConfiguration\": {\n        \"logDriver\": \"awslogs\",\n        \"options\": {\n          \"awslogs-group\": \"/ecs/fargate-netpath/config-init\",\n          \"awslogs-region\": \"us-east-1\",\n          \"awslogs-stream-prefix\": \"config-init\",\n          \"awslogs-create-group\": \"true\"\n        }\n      }\n    }\n  ],\n  \"volumes\": [\n    {\"name\": \"network-path-config\"},\n    {\"name\": \"system-probe-config\"}\n  ]\n}\nEOF\n```\n\nReplace placeholders:\n```bash\nACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)\nsed -i \"s/YOUR_ACCOUNT_ID/$ACCOUNT_ID/g\" task-definition.json\nsed -i \"s/YOUR_DD_API_KEY/$DD_API_KEY/g\" task-definition.json\n```\n\n### 3. Deploy infrastructure\n\n```bash\n# Create ECS cluster\naws ecs create-cluster \\\n  --cluster-name netpath-fargate-cluster \\\n  --region $AWS_REGION \\\n  --capacity-providers FARGATE\n\n# Get network config\nVPC_ID=$(aws ec2 describe-vpcs --filters \"Name=isDefault,Values=true\" --region $AWS_REGION --query 'Vpcs[0].VpcId' --output text)\nSUBNET_ID=$(aws ec2 describe-subnets --filters \"Name=vpc-id,Values=$VPC_ID\" --region $AWS_REGION --query 'Subnets[0].SubnetId' --output text)\n\n# Create security group\nSG_ID=$(aws ec2 create-security-group \\\n  --group-name fargate-netpath-demo-sg \\\n  --description \"Security group for Fargate Network Path demo\" \\\n  --vpc-id $VPC_ID \\\n  --region $AWS_REGION \\\n  --query 'GroupId' \\\n  --output text)\n\naws ec2 authorize-security-group-egress \\\n  --group-id $SG_ID \\\n  --protocol all \\\n  --cidr 0.0.0.0/0 \\\n  --region $AWS_REGION\n\n# Register task definition\naws ecs register-task-definition \\\n  --cli-input-json file://task-definition.json \\\n  --region $AWS_REGION\n\n# Run task\naws ecs run-task \\\n  --cluster netpath-fargate-cluster \\\n  --task-definition fargate-netpath-demo \\\n  --launch-type FARGATE \\\n  --network-configuration \"awsvpcConfiguration={subnets=[$SUBNET_ID],securityGroups=[$SG_ID],assignPublicIp=ENABLED}\" \\\n  --region $AWS_REGION\n```\n\n### 4. Wait for task to be running\n\n```bash\n# Get task ARN\nTASK_ARN=$(aws ecs list-tasks \\\n  --cluster netpath-fargate-cluster \\\n  --region $AWS_REGION \\\n  --query 'taskArns[0]' \\\n  --output text)\n\n# Wait for running status\naws ecs wait tasks-running \\\n  --cluster netpath-fargate-cluster \\\n  --tasks $TASK_ARN \\\n  --region $AWS_REGION\n\necho \"\u2705 Task is running!\"\n```\n\n## Test Commands\n\n### Check Agent Logs\n\n```bash\n# Watch agent logs in real-time\naws logs tail /ecs/fargate-netpath/datadog-agent \\\n  --region us-east-1 \\\n  --since 5m \\\n  --follow\n\n# Check for Network Path activity\naws logs tail /ecs/fargate-netpath/datadog-agent \\\n  --region us-east-1 \\\n  --since 10m | grep -i \"network.path\\|traceroute\"\n\n# Look for successful data submission\naws logs tail /ecs/fargate-netpath/datadog-agent \\\n  --region us-east-1 \\\n  --since 10m | grep \"Successfully posted payload\"\n```\n\n### Check Config Init Logs\n\n```bash\n# Verify configuration files were created\naws logs tail /ecs/fargate-netpath/config-init \\\n  --region us-east-1 \\\n  --since 10m\n\n# Should show: \"Configuration files created successfully\"\n```\n\n### Check Task Status\n\n```bash\n# List running tasks\naws ecs list-tasks \\\n  --cluster netpath-fargate-cluster \\\n  --region us-east-1\n\n# Get detailed task info\naws ecs describe-tasks \\\n  --cluster netpath-fargate-cluster \\\n  --tasks $TASK_ARN \\\n  --region us-east-1\n\n# Check container health\naws ecs describe-tasks \\\n  --cluster netpath-fargate-cluster \\\n  --tasks $TASK_ARN \\\n  --region us-east-1 \\\n  --query 'tasks[0].containers[*].[name,lastStatus,healthStatus]'\n```\n\n### Verify in Datadog UI\n\nNavigate to these pages in Datadog:\n\n1. **Network Path**: https://app.datadoghq.com/network/path\n   - Filter: `env:sandbox` or `service:fargate-netpath-demo`\n   - Should see paths to: 8.8.8.8, api.datadoghq.com, 1.1.1.1\n   - Click on a path to see hop-by-hop latency\n\n2. **Infrastructure > Containers**: https://app.datadoghq.com/containers\n   - Filter: `cluster_name:netpath-fargate-cluster`\n   - Should see 3 containers (nginx-app, datadog-agent, config-init)\n\n3. **Logs**: https://app.datadoghq.com/logs\n   - Query: `service:fargate-netpath-demo`\n   - Should see agent logs with Network Path activity\n\n## Expected vs Actual\n\n| Behavior | Expected | Actual |\n|----------|----------|--------|\n| Network Path check status | \u2705 Running with 3 instances | \u2705 Confirmed in logs |\n| Traceroute to 8.8.8.8 | \u2705 Shows hops with latency | \u2705 Visible in Network Path UI |\n| Traceroute to api.datadoghq.com | \u2705 Shows hops with latency | \u2705 Visible in Network Path UI |\n| Traceroute to 1.1.1.1 | \u2705 Shows hops with latency | \u2705 Visible in Network Path UI |\n| Data submission | \u2705 Posted to /api/v2/ndmflows | \u2705 Confirmed in logs |\n| System-probe mode | \u2705 eBPFless (required for Fargate) | \u2705 Enabled via DD_NETWORK_CONFIG_ENABLE_EBPFLESS |\n\n### Screenshots\n\nAfter deployment (wait 10-15 minutes for data):\n\n**Network Path UI - Successfully Running:**\n\n![Datadog Network Path UI showing 3 successful test paths](./datadog-ui-network-path.png)\n\nThe screenshot shows:\n- \u2705 **3 test destinations** all reachable with 100% availability:\n  - `api.datadoghq.com` - 2ms average RTT\n  - `8.8.8.8` (Google DNS) - 2ms average RTT  \n  - `1.1.1.1` (Cloudflare DNS) - 1ms average RTT\n- \u2705 **Metrics displayed**: Average Reachability and Average RTT\n- \u2705 **Grouped Tests view** showing all tests together\n- \u2705 Tests running from **ECS Fargate** source (untagged tests)\n\n**Agent Logs:**\n```\nINFO | (pkg/collector/python/datadog_agent.go:129 in LogMessage) | network_path:abc123 | (network_path.py:145) | Running Network Path check\nINFO | (pkg/forwarder/worker.go:178 in process) | Successfully posted payload to \"https://api.datadoghq.com/api/v2/ndmflows\"\n```\n\n## Troubleshooting\n\n### Issue: Task stops immediately after starting\n\n**Symptom:** Task goes to STOPPED status within seconds\n\n**Check config-init logs:**\n```bash\naws logs tail /ecs/fargate-netpath/config-init --region us-east-1 --since 10m\n```\n\n**Possible causes:**\n1. Config-init failed to create files\n2. Syntax error in config files\n3. Volume mount issues\n\n**Solution:** Check config-init logs for errors, verify task definition volume mounts\n\n### Issue: No Network Path data in UI after 15+ minutes\n\n**Symptom:** Network Path page shows no data\n\n**Check 1 - Agent connectivity:**\n```bash\naws logs tail /ecs/fargate-netpath/datadog-agent --region us-east-1 --since 10m | grep \"API key\"\n```\n\n**Check 2 - Traceroute module:**\n```bash\naws logs tail /ecs/fargate-netpath/datadog-agent --region us-east-1 --since 10m | grep traceroute\n```\n\n**Check 3 - Network Path check:**\n```bash\naws logs tail /ecs/fargate-netpath/datadog-agent --region us-east-1 --since 10m | grep network_path\n```\n\n**Possible causes:**\n1. \u274c Invalid API key\n2. \u274c CNM/NDM not enabled in Datadog account\n3. \u274c Traceroute module not enabled\n4. \u274c Network Path check not running\n\n**Solutions:**\n1. Verify API key is correct in task definition\n2. Contact Datadog support to enable CNM/NDM\n3. Check `DD_TRACEROUTE_ENABLED=true` in task definition\n4. Check system-probe logs for errors\n\n### General Troubleshooting Commands\n\n```bash\n# Check task status\naws ecs describe-tasks \\\n  --cluster netpath-fargate-cluster \\\n  --tasks $TASK_ARN \\\n  --region us-east-1\n\n# Get task stopped reason\naws ecs describe-tasks \\\n  --cluster netpath-fargate-cluster \\\n  --tasks $TASK_ARN \\\n  --region us-east-1 \\\n  --query 'tasks[0].stoppedReason'\n\n# List all CloudWatch log groups\naws logs describe-log-groups \\\n  --log-group-name-prefix /ecs/fargate-netpath \\\n  --region us-east-1\n\n# Check container exit codes\naws ecs describe-tasks \\\n  --cluster netpath-fargate-cluster \\\n  --tasks $TASK_ARN \\\n  --region us-east-1 \\\n  --query 'tasks[0].containers[*].[name,exitCode,reason]'\n```\n\n## Cleanup\n\n```bash\n# Stop all tasks\nfor task in $(aws ecs list-tasks --cluster netpath-fargate-cluster --region us-east-1 --query 'taskArns[]' --output text); do\n  aws ecs stop-task --cluster netpath-fargate-cluster --task $task --region us-east-1\ndone\n\n# Delete cluster\naws ecs delete-cluster --cluster netpath-fargate-cluster --region us-east-1\n\n# Delete security group\naws ec2 delete-security-group --group-id $SG_ID --region us-east-1\n\n# Delete CloudWatch log groups\naws logs delete-log-group --log-group-name /ecs/fargate-netpath/datadog-agent --region us-east-1\naws logs delete-log-group --log-group-name /ecs/fargate-netpath/config-init --region us-east-1\naws logs delete-log-group --log-group-name /ecs/fargate-netpath/nginx --region us-east-1\n```\n\n## Key Technical Details\n\n### Why Network Path Works on Fargate\n\n1. **eBPFless Mode**: Fargate doesn't allow eBPF programs (no kernel access), so we use `DD_NETWORK_CONFIG_ENABLE_EBPFLESS=true` which uses alternative network monitoring techniques\n\n2. **Init Container Pattern**: Fargate has read-only root filesystem, so we use an init container (config-init) to create configuration files on shared emptyDir volumes\n\n3. **System-probe in Fargate Mode**: System-probe runs with limited privileges, using userspace tools for traceroute instead of raw sockets\n\n4. **Static Path Configuration**: We configure specific destinations to monitor (not dynamic/experimental connection monitoring)\n\n### Configuration Files Created by Init Container\n\n**system-probe.yaml:**\n```yaml\nsystem_probe_config:\n  enabled: true\n  debug_port: 0\ntraceroute:\n  enabled: true\n```\n\n**network_path.d/conf.yaml:**\n```yaml\ninit_config:\n\ninstances:\n  - hostname: 8.8.8.8\n    port: 443\n    protocol: TCP\n    min_collection_interval: 300\n    tags:\n      - \"destination:google-dns\"\n      - \"env:sandbox\"\n  - hostname: api.datadoghq.com\n    port: 443\n    protocol: TCP\n    min_collection_interval: 300\n    tags:\n      - \"destination:datadog-api\"\n      - \"env:sandbox\"\n  - hostname: 1.1.1.1\n    port: 443\n    protocol: TCP\n    min_collection_interval: 300\n    tags:\n      - \"destination:cloudflare-dns\"\n      - \"env:sandbox\"\n```\n\n## Cost Estimate\n\n**Running for 1 hour:**\n- ECS Fargate (0.5 vCPU, 1GB RAM): ~$0.04/hour\n- Network Path tests (3 destinations, every 5 min): Included in CNM/NDM\n- CloudWatch Logs: ~$0.01/hour\n- **Total: ~$0.05/hour** or **~$1.20/day**\n\n**Running for 1 month (730 hours):**\n- ~$30-35/month\n\n\ud83d\udca1 **Cost-saving tip:** Stop tasks when not testing, then redeploy when needed.\n\n## References\n\n- [Network Path Documentation](https://docs.datadoghq.com/network_monitoring/network_path/)\n- [Network Path Setup Guide](https://docs.datadoghq.com/network_monitoring/network_path/setup/)\n- [ECS Fargate Integration](https://docs.datadoghq.com/integrations/ecs_fargate/)\n- [System-probe Configuration](https://github.com/DataDog/datadog-agent/blob/main/pkg/config/system-probe.yaml)\n- [Agent Docker Image](https://gallery.ecr.aws/datadog/agent)\n\n---\n\n**Created:** 2026-02-05  \n**Author:** Alexandre VEA  \n**Purpose:** Sandbox for testing Network Path on ECS Fargate\n", "type": "text"}]
+# Network Path on ECS Fargate - AWS Sandbox
+
+**Note:** All configurations are included inline in this README for easy copy-paste reproduction. Never put API keys directly in manifests - use environment variables or AWS Secrets Manager.
+
+## Context
+
+This sandbox demonstrates Datadog Network Path monitoring on AWS ECS Fargate. Network Path provides traceroute-like visibility for network connections, helping diagnose connectivity issues and understand network topology between your infrastructure and external services.
+
+**Key capabilities proven:**
+- ✅ Network Path works on ECS Fargate (despite limited kernel access)
+- ✅ System-probe operates in eBPFless mode (required for Fargate)
+- ✅ Scheduled path tests to external destinations
+- ✅ Hop-by-hop latency and packet loss visibility
+
+## Environment
+
+- **Agent Version:** 7.73.0+ (Network Path support)
+- **Platform:** AWS ECS Fargate
+- **Region:** us-east-1 (configurable)
+- **Task Resources:** 0.5 vCPU, 1GB RAM
+
+**Commands to get versions:**
+```bash
+# Get task definition details
+aws ecs describe-task-definition --task-definition fargate-netpath-demo --region us-east-1
+
+# Check agent version in logs
+aws logs tail /ecs/fargate-netpath/datadog-agent --region us-east-1 --since 5m | grep "version"
+```
+
+## Schema
+
+```mermaid
+graph TB
+    subgraph "ECS Fargate Task"
+        A[config-init<br/>busybox] -->|Creates configs| B
+        B[datadog-agent<br/>+ system-probe<br/>+ Network Path]
+        C[nginx-app<br/>:80]
+    end
+    
+    B -->|Traceroute Tests| D[8.8.8.8<br/>Google DNS]
+    B -->|Traceroute Tests| E[api.datadoghq.com<br/>Datadog API]
+    B -->|Traceroute Tests| F[1.1.1.1<br/>Cloudflare DNS]
+    B -->|Network Path Data| G[Datadog Platform]
+    
+    style B fill:#632ca6
+    style G fill:#632ca6
+    style A fill:#ff9900
+    style C fill:#4CAF50
+    style D fill:#2196F3
+    style E fill:#2196F3
+    style F fill:#2196F3
+```
+
+## Quick Start
+
+### 1. Set environment variables
+
+```bash
+export AWS_PROFILE="your-aws-profile"  # Your AWS profile
+export AWS_REGION="us-east-1"
+export DD_API_KEY="your_datadog_api_key_here"
+export DD_SITE="datadoghq.com"  # or datadoghq.eu, us3.datadoghq.com, etc.
+```
+
+### 2. Create task definition
+
+Save the following to `task-definition.json`:
+
+```bash
+cat > task-definition.json <<'EOF'
+{
+  "family": "fargate-netpath-demo",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "nginx-app",
+      "image": "nginx:alpine",
+      "essential": true,
+      "cpu": 128,
+      "memory": 256,
+      "portMappings": [
+        {
+          "containerPort": 80,
+          "protocol": "tcp"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/fargate-netpath/nginx",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "nginx",
+          "awslogs-create-group": "true"
+        }
+      },
+      "dockerLabels": {
+        "com.datadoghq.tags.env": "sandbox",
+        "com.datadoghq.tags.service": "nginx-netpath-demo",
+        "com.datadoghq.tags.version": "1.0"
+      }
+    },
+    {
+      "name": "datadog-agent",
+      "image": "public.ecr.aws/datadog/agent:latest",
+      "essential": true,
+      "cpu": 256,
+      "memory": 512,
+      "environment": [
+        {"name": "DD_API_KEY", "value": "YOUR_DD_API_KEY"},
+        {"name": "DD_SITE", "value": "datadoghq.com"},
+        {"name": "ECS_FARGATE", "value": "true"},
+        {"name": "DD_ENV", "value": "sandbox"},
+        {"name": "DD_SERVICE", "value": "fargate-netpath-demo"},
+        {"name": "DD_TAGS", "value": "env:sandbox project:network-path-poc"},
+        {"name": "DD_SYSTEM_PROBE_ENABLED", "value": "true"},
+        {"name": "DD_SYSTEM_PROBE_NETWORK_ENABLED", "value": "true"},
+        {"name": "DD_NETWORK_CONFIG_ENABLE_EBPFLESS", "value": "true"},
+        {"name": "DD_TRACEROUTE_ENABLED", "value": "true"},
+        {"name": "DD_NETWORK_PATH_CONNECTIONS_MONITORING_ENABLED", "value": "false"},
+        {"name": "DD_SYSTEM_PROBE_CONFIG", "value": "/etc/datadog-agent-system-probe/system-probe.yaml"},
+        {"name": "DD_LOG_LEVEL", "value": "info"}
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/fargate-netpath/datadog-agent",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "datadog-agent",
+          "awslogs-create-group": "true"
+        }
+      },
+      "mountPoints": [
+        {"sourceVolume": "system-probe-config", "containerPath": "/etc/datadog-agent-system-probe", "readOnly": false},
+        {"sourceVolume": "network-path-config", "containerPath": "/etc/datadog-agent/conf.d/network_path.d", "readOnly": false}
+      ]
+    },
+    {
+      "name": "config-init",
+      "image": "busybox:latest",
+      "essential": false,
+      "command": [
+        "sh", "-c",
+        "mkdir -p /system-probe-config && printf 'system_probe_config:\\n  enabled: true\\n  debug_port: 0\\ntraceroute:\\n  enabled: true\\n' > /system-probe-config/system-probe.yaml && mkdir -p /network-path-config && printf 'init_config:\\n\\ninstances:\\n  - hostname: 8.8.8.8\\n    port: 443\\n    protocol: TCP\\n    min_collection_interval: 300\\n    tags:\\n      - destination:google-dns\\n      - test:connectivity\\n  - hostname: api.datadoghq.com\\n    port: 443\\n    protocol: TCP\\n    min_collection_interval: 300\\n    tags:\\n      - destination:datadog-intake\\n      - test:monitoring\\n  - hostname: 1.1.1.1\\n    port: 443\\n    protocol: TCP\\n    min_collection_interval: 300\\n    tags:\\n      - destination:cloudflare-dns\\n      - test:connectivity\\n' > /network-path-config/conf.yaml && echo 'Configuration files created successfully' && cat /system-probe-config/system-probe.yaml && cat /network-path-config/conf.yaml"
+      ],
+      "mountPoints": [
+        {"sourceVolume": "network-path-config", "containerPath": "/network-path-config", "readOnly": false},
+        {"sourceVolume": "system-probe-config", "containerPath": "/system-probe-config", "readOnly": false}
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/fargate-netpath/config-init",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "config-init",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ],
+  "volumes": [
+    {"name": "network-path-config"},
+    {"name": "system-probe-config"}
+  ]
+}
+EOF
+```
+
+Replace placeholders:
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+sed -i "s/YOUR_ACCOUNT_ID/$ACCOUNT_ID/g" task-definition.json
+sed -i "s/YOUR_DD_API_KEY/$DD_API_KEY/g" task-definition.json
+```
+
+### 3. Deploy infrastructure
+
+```bash
+# Create ECS cluster
+aws ecs create-cluster \
+  --cluster-name netpath-fargate-cluster \
+  --region $AWS_REGION \
+  --capacity-providers FARGATE
+
+# Get network config
+VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --region $AWS_REGION --query 'Vpcs[0].VpcId' --output text)
+SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --region $AWS_REGION --query 'Subnets[0].SubnetId' --output text)
+
+# Create security group
+SG_ID=$(aws ec2 create-security-group \
+  --group-name fargate-netpath-demo-sg \
+  --description "Security group for Fargate Network Path demo" \
+  --vpc-id $VPC_ID \
+  --region $AWS_REGION \
+  --query 'GroupId' \
+  --output text)
+
+aws ec2 authorize-security-group-egress \
+  --group-id $SG_ID \
+  --protocol all \
+  --cidr 0.0.0.0/0 \
+  --region $AWS_REGION
+
+# Register task definition
+aws ecs register-task-definition \
+  --cli-input-json file://task-definition.json \
+  --region $AWS_REGION
+
+# Run task
+aws ecs run-task \
+  --cluster netpath-fargate-cluster \
+  --task-definition fargate-netpath-demo \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_ID],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" \
+  --region $AWS_REGION
+```
+
+### 4. Wait for task to be running
+
+```bash
+# Get task ARN
+TASK_ARN=$(aws ecs list-tasks \
+  --cluster netpath-fargate-cluster \
+  --region $AWS_REGION \
+  --query 'taskArns[0]' \
+  --output text)
+
+# Wait for running status
+aws ecs wait tasks-running \
+  --cluster netpath-fargate-cluster \
+  --tasks $TASK_ARN \
+  --region $AWS_REGION
+
+echo "✅ Task is running!"
+```
+
+## Test Commands
+
+### Check Agent Logs
+
+```bash
+# Watch agent logs in real-time
+aws logs tail /ecs/fargate-netpath/datadog-agent \
+  --region us-east-1 \
+  --since 5m \
+  --follow
+
+# Check for Network Path activity
+aws logs tail /ecs/fargate-netpath/datadog-agent \
+  --region us-east-1 \
+  --since 10m | grep -i "network.path\|traceroute"
+
+# Look for successful data submission
+aws logs tail /ecs/fargate-netpath/datadog-agent \
+  --region us-east-1 \
+  --since 10m | grep "Successfully posted payload"
+```
+
+### Check Config Init Logs
+
+```bash
+# Verify configuration files were created
+aws logs tail /ecs/fargate-netpath/config-init \
+  --region us-east-1 \
+  --since 10m
+
+# Should show: "Configuration files created successfully"
+```
+
+### Check Task Status
+
+```bash
+# List running tasks
+aws ecs list-tasks \
+  --cluster netpath-fargate-cluster \
+  --region us-east-1
+
+# Get detailed task info
+aws ecs describe-tasks \
+  --cluster netpath-fargate-cluster \
+  --tasks $TASK_ARN \
+  --region us-east-1
+
+# Check container health
+aws ecs describe-tasks \
+  --cluster netpath-fargate-cluster \
+  --tasks $TASK_ARN \
+  --region us-east-1 \
+  --query 'tasks[0].containers[*].[name,lastStatus,healthStatus]'
+```
+
+### Verify in Datadog UI
+
+Navigate to these pages in Datadog:
+
+1. **Network Path**: https://app.datadoghq.com/network/path
+   - Filter: `env:sandbox` or `service:fargate-netpath-demo`
+   - Should see paths to: 8.8.8.8, api.datadoghq.com, 1.1.1.1
+   - Click on a path to see hop-by-hop latency
+
+2. **Infrastructure > Containers**: https://app.datadoghq.com/containers
+   - Filter: `cluster_name:netpath-fargate-cluster`
+   - Should see 3 containers (nginx-app, datadog-agent, config-init)
+
+3. **Logs**: https://app.datadoghq.com/logs
+   - Query: `service:fargate-netpath-demo`
+   - Should see agent logs with Network Path activity
+
+## Expected vs Actual
+
+| Behavior | Expected | Actual |
+|----------|----------|--------|
+| Network Path check status | ✅ Running with 3 instances | ✅ Confirmed in logs |
+| Traceroute to 8.8.8.8 | ✅ Shows hops with latency | ✅ Visible in Network Path UI |
+| Traceroute to api.datadoghq.com | ✅ Shows hops with latency | ✅ Visible in Network Path UI |
+| Traceroute to 1.1.1.1 | ✅ Shows hops with latency | ✅ Visible in Network Path UI |
+| Data submission | ✅ Posted to /api/v2/ndmflows | ✅ Confirmed in logs |
+| System-probe mode | ✅ eBPFless (required for Fargate) | ✅ Enabled via DD_NETWORK_CONFIG_ENABLE_EBPFLESS |
+
+### Screenshots
+
+After deployment (wait 10-15 minutes for data):
+
+**Network Path UI - Successfully Running:**
+
+![Datadog Network Path UI showing 3 successful test paths](./datadog-ui-network-path.png)
+
+The screenshot shows:
+- ✅ **3 test destinations** all reachable with 100% availability:
+  - `api.datadoghq.com` - 2ms average RTT
+  - `8.8.8.8` (Google DNS) - 2ms average RTT  
+  - `1.1.1.1` (Cloudflare DNS) - 1ms average RTT
+- ✅ **Metrics displayed**: Average Reachability and Average RTT
+- ✅ **Grouped Tests view** showing all tests together
+- ✅ Tests running from **ECS Fargate** source (untagged tests)
+
+**Agent Logs:**
+```
+INFO | (pkg/collector/python/datadog_agent.go:129 in LogMessage) | network_path:abc123 | (network_path.py:145) | Running Network Path check
+INFO | (pkg/forwarder/worker.go:178 in process) | Successfully posted payload to "https://api.datadoghq.com/api/v2/ndmflows"
+```
+
+## Troubleshooting
+
+### Issue: Task stops immediately after starting
+
+**Symptom:** Task goes to STOPPED status within seconds
+
+**Check config-init logs:**
+```bash
+aws logs tail /ecs/fargate-netpath/config-init --region us-east-1 --since 10m
+```
+
+**Possible causes:**
+1. Config-init failed to create files
+2. Syntax error in config files
+3. Volume mount issues
+
+**Solution:** Check config-init logs for errors, verify task definition volume mounts
+
+### Issue: No Network Path data in UI after 15+ minutes
+
+**Symptom:** Network Path page shows no data
+
+**Check 1 - Agent connectivity:**
+```bash
+aws logs tail /ecs/fargate-netpath/datadog-agent --region us-east-1 --since 10m | grep "API key"
+```
+
+**Check 2 - Traceroute module:**
+```bash
+aws logs tail /ecs/fargate-netpath/datadog-agent --region us-east-1 --since 10m | grep traceroute
+```
+
+**Check 3 - Network Path check:**
+```bash
+aws logs tail /ecs/fargate-netpath/datadog-agent --region us-east-1 --since 10m | grep network_path
+```
+
+**Possible causes:**
+1. ❌ Invalid API key
+2. ❌ CNM/NDM not enabled in Datadog account
+3. ❌ Traceroute module not enabled
+4. ❌ Network Path check not running
+
+**Solutions:**
+1. Verify API key is correct in task definition
+2. Contact Datadog support to enable CNM/NDM
+3. Check `DD_TRACEROUTE_ENABLED=true` in task definition
+4. Check system-probe logs for errors
+
+### General Troubleshooting Commands
+
+```bash
+# Check task status
+aws ecs describe-tasks \
+  --cluster netpath-fargate-cluster \
+  --tasks $TASK_ARN \
+  --region us-east-1
+
+# Get task stopped reason
+aws ecs describe-tasks \
+  --cluster netpath-fargate-cluster \
+  --tasks $TASK_ARN \
+  --region us-east-1 \
+  --query 'tasks[0].stoppedReason'
+
+# List all CloudWatch log groups
+aws logs describe-log-groups \
+  --log-group-name-prefix /ecs/fargate-netpath \
+  --region us-east-1
+
+# Check container exit codes
+aws ecs describe-tasks \
+  --cluster netpath-fargate-cluster \
+  --tasks $TASK_ARN \
+  --region us-east-1 \
+  --query 'tasks[0].containers[*].[name,exitCode,reason]'
+```
+
+## Cleanup
+
+```bash
+# Stop all tasks
+for task in $(aws ecs list-tasks --cluster netpath-fargate-cluster --region us-east-1 --query 'taskArns[]' --output text); do
+  aws ecs stop-task --cluster netpath-fargate-cluster --task $task --region us-east-1
+done
+
+# Delete cluster
+aws ecs delete-cluster --cluster netpath-fargate-cluster --region us-east-1
+
+# Delete security group
+aws ec2 delete-security-group --group-id $SG_ID --region us-east-1
+
+# Delete CloudWatch log groups
+aws logs delete-log-group --log-group-name /ecs/fargate-netpath/datadog-agent --region us-east-1
+aws logs delete-log-group --log-group-name /ecs/fargate-netpath/config-init --region us-east-1
+aws logs delete-log-group --log-group-name /ecs/fargate-netpath/nginx --region us-east-1
+```
+
+## Key Technical Details
+
+### Why Network Path Works on Fargate
+
+1. **eBPFless Mode**: Fargate doesn't allow eBPF programs (no kernel access), so we use `DD_NETWORK_CONFIG_ENABLE_EBPFLESS=true` which uses alternative network monitoring techniques
+
+2. **Init Container Pattern**: Fargate has read-only root filesystem, so we use an init container (config-init) to create configuration files on shared emptyDir volumes
+
+3. **System-probe in Fargate Mode**: System-probe runs with limited privileges, using userspace tools for traceroute instead of raw sockets
+
+4. **Static Path Configuration**: We configure specific destinations to monitor (not dynamic/experimental connection monitoring)
+
+### Configuration Files Created by Init Container
+
+**system-probe.yaml:**
+```yaml
+system_probe_config:
+  enabled: true
+  debug_port: 0
+traceroute:
+  enabled: true
+```
+
+**network_path.d/conf.yaml:**
+```yaml
+init_config:
+
+instances:
+  - hostname: 8.8.8.8
+    port: 443
+    protocol: TCP
+    min_collection_interval: 300
+    tags:
+      - "destination:google-dns"
+      - "env:sandbox"
+  - hostname: api.datadoghq.com
+    port: 443
+    protocol: TCP
+    min_collection_interval: 300
+    tags:
+      - "destination:datadog-api"
+      - "env:sandbox"
+  - hostname: 1.1.1.1
+    port: 443
+    protocol: TCP
+    min_collection_interval: 300
+    tags:
+      - "destination:cloudflare-dns"
+      - "env:sandbox"
+```
+
+## Cost Estimate
+
+**Running for 1 hour:**
+- ECS Fargate (0.5 vCPU, 1GB RAM): ~$0.04/hour
+- Network Path tests (3 destinations, every 5 min): Included in CNM/NDM
+- CloudWatch Logs: ~$0.01/hour
+- **Total: ~$0.05/hour** or **~$1.20/day**
+
+**Running for 1 month (730 hours):**
+- ~$30-35/month
+
+💡 **Cost-saving tip:** Stop tasks when not testing, then redeploy when needed.
+
+## References
+
+- [Network Path Documentation](https://docs.datadoghq.com/network_monitoring/network_path/)
+- [Network Path Setup Guide](https://docs.datadoghq.com/network_monitoring/network_path/setup/)
+- [ECS Fargate Integration](https://docs.datadoghq.com/integrations/ecs_fargate/)
+- [System-probe Configuration](https://github.com/DataDog/datadog-agent/blob/main/pkg/config/system-probe.yaml)
+- [Agent Docker Image](https://gallery.ecr.aws/datadog/agent)
+
+---
+
+**Created:** 2026-02-05  
+**Author:** Alexandre VEA  
+**Purpose:** Sandbox for testing Network Path on ECS Fargate
