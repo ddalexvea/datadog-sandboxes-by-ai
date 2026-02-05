@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: datadog-kube-state-metrics-core-config
+  namespace: datadog
+  labels:
+    app.kubernetes.io/instance: datadog
+    app.kubernetes.io/managed-by: datadog-operator
+data:
+  kubernetes_state_core.yaml.default: |
+    ---
+    cluster_check: false
+    init_config:
+    instances:
+      - skip_leader_election: false
+        collectors:
+        - pods
+        - replicationcontrollers
+        - statefulsets
+        - nodes
+        - cronjobs
+        - jobs
+        - replicasets
+        - deployments
+        - configmaps
+        - services
+        - endpoints
+        - daemonsets
+        - horizontalpodautoscalers
+        - poddisruptionbudgets
+        - limitranges
+        - resourcequotas
+        - secrets
+        - namespaces
+        - persistentvolumeclaims
+        - persistentvolumes
+        - ingresses
+        - storageclasses
+        - volumeattachments
+        - apiservices
+        - controllerrevisions
+        - customresourcedefinitions
