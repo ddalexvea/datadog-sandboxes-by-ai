@@ -9,12 +9,12 @@ This sandbox demonstrates **APM/DBM correlation** for a .NET application connect
 - Configuring `DD_DBM_PROPAGATION_MODE=full` for trace-query correlation
 - Troubleshooting SSI when language detection fails for native binaries
 
-### Key Findings
+**Full documentation available in the original repository:** [datadog-agent-sqlserver-dotnet-ssi-correlation](https://github.com/ddalexvea/datadog-agent-sqlserver-dotnet-ssi-correlation)
 
-1. **SSI with native .NET binaries** (apphost) requires manual `CORECLR_*` environment variables when the launcher doesn't detect .NET
-2. **Cluster checks** need explicit `clusterChecks.enabled: true` in DatadogAgent spec
-3. The .NET tracer creates a **separate service** for DB calls (e.g., `demo-api-sql-server`)
-4. APM/DBM correlation uses `traceparent` comments injected into SQL queries
-5. **⚠️ CRITICAL: Microsoft.Data.SqlClient version must be 5.x or lower** - The .NET tracer (as of v3.6.1) only supports `Microsoft.Data.SqlClient` versions 1.0.0 to 5.x. Version 6.x is NOT yet supported and will result in no SQL spans being created.
+## Key Topics
 
-(Content continues but truncated for brevity - I'll use the actual full content from the API response)
+- SQL Server DBM setup
+- .NET Single Step Instrumentation (SSI)
+- APM/DBM correlation configuration
+- Microsoft.Data.SqlClient version compatibility (5.x only)
+- Troubleshooting missing SQL spans
