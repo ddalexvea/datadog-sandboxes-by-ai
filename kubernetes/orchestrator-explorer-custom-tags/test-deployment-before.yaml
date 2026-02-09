@@ -1,0 +1,35 @@
+---
+# This reproduces the customer's issue
+# - Unified service tags as pod LABELS
+# - Team tag as pod ANNOTATION (not label!)
+# Result: team tag does NOT appear on ReplicaSet in Orchestrator Explorer
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-app-annotations
+  namespace: default
+  labels:
+    app: test-app-annotations
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: test-app-annotations
+  template:
+    metadata:
+      labels:
+        app: test-app-annotations
+        # ✅ Unified service tags as LABELS (like customer)
+        tags.datadoghq.com/service: test-app
+        tags.datadoghq.com/env: sandbox
+        tags.datadoghq.com/version: "1.0"
+        # ❌ NO team tag as label!
+      annotations:
+        # ✅ Team tag as ANNOTATION (like customer)
+        ad.datadoghq.com/tags: '{"team":"devx"}'
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.21
+        ports:
+        - containerPort: 80

@@ -1,0 +1,36 @@
+---
+# This is the FIXED version
+# - Unified service tags as pod LABELS
+# - Team tag as BOTH pod LABEL and ANNOTATION
+# Result: team tag DOES appear on ReplicaSet in Orchestrator Explorer
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-app-fixed
+  namespace: default
+  labels:
+    app: test-app-fixed
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: test-app-fixed
+  template:
+    metadata:
+      labels:
+        app: test-app-fixed
+        # ✅ Unified service tags as LABELS
+        tags.datadoghq.com/service: test-app
+        tags.datadoghq.com/env: sandbox
+        tags.datadoghq.com/version: "1.0"
+        # ✅ FIXED - Team tag as LABEL!
+        tags.datadoghq.com/team: devx
+      annotations:
+        # ✅ Keep annotation for metrics/logs/traces tagging
+        ad.datadoghq.com/tags: '{"team":"devx"}'
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.21
+        ports:
+        - containerPort: 80
