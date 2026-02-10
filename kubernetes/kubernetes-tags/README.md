@@ -1,0 +1,1 @@
+(content will be the full kubernetes-tags README from the earlier fetch)
