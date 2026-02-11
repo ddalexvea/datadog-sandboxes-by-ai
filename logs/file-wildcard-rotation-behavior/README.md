@@ -25,7 +25,7 @@ docker exec -it datadog-rotation-demo agent version
 graph LR
     A[Log Rotator Script] -->|Every 60s| B[Create New Log File]
     B --> C[app-TIMESTAMP.log]
-    D[Datadog Agent] -->|Scans every 5s| E[/var/log/app/app-*.log]
+    D[Datadog Agent] -->|Scans every 5s| E["Wildcard: app-STAR.log"]
     E --> F{open_files_limit reached?}
     F -->|Yes| G[Stop old tailers]
     F -->|No| H[Keep all tailers active]
