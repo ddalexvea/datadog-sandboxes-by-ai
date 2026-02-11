@@ -1,10 +1,10 @@
-# Log File Wildcard Rotation Behavior
+# Log File Wildcard Rotation - How open_files_limit Works
 
 **Note:** All configurations are included inline in this README for easy copy-paste reproduction.
 
 ## Context
 
-This sandbox demonstrates how the Datadog Agent handles log file rotation when using wildcard paths (e.g., `app-*.log`). It tests the interaction between `file_wildcard_selection_mode: by_modification_time` and `open_files_limit` to prove whether old rotated files are automatically dropped from tailing.
+This sandbox demonstrates how the Datadog Agent handles log file rotation when using wildcard paths (e.g., `app-*.log`). It proves the interaction between `file_wildcard_selection_mode: by_modification_time` and `open_files_limit`.
 
 **Critical Finding:** `file_wildcard_selection_mode: by_modification_time` alone **DOES NOT** drop old files. You must also set `open_files_limit` to force the agent to stop tailing old rotated logs.
 
@@ -13,6 +13,11 @@ This sandbox demonstrates how the Datadog Agent handles log file rotation when u
 - **Agent Version:** 7.60.0
 - **Platform:** Docker / docker-compose
 - **Test:** Automated log rotation every 60 seconds
+
+**Commands to get versions:**
+```bash
+docker exec -it datadog-rotation-demo agent version
+```
 
 ## Schema
 
@@ -30,7 +35,7 @@ graph LR
 
 ## Quick Start
 
-### 1. Create Directory Structure
+### 1. Create Directory and Files
 
 ```bash
 mkdir -p file-wildcard-rotation-demo/{conf.d,logs,agent-logs}
@@ -39,40 +44,34 @@ cd file-wildcard-rotation-demo
 
 ### 2. Create Dockerfile
 
-```dockerfile
+```bash
+cat > Dockerfile <<'EOF'
 FROM datadog/agent:7.60.0
 
-# Install necessary tools
-RUN apt-get update && apt-get install -y \
-    procps \
-    vim \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create log directory
+RUN apt-get update && apt-get install -y procps vim && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /var/log/app
 
-# Copy configuration files
 COPY datadog.yaml /etc/datadog-agent/datadog.yaml
 COPY conf.d/app_logs.yaml /etc/datadog-agent/conf.d/app_logs.d/conf.yaml
 COPY log-rotator.sh /usr/local/bin/log-rotator.sh
 RUN chmod +x /usr/local/bin/log-rotator.sh
 
-# Set environment variables
 ENV DD_API_KEY=dummy_key_for_testing
 ENV DD_SITE=datadoghq.com
 ENV DD_LOGS_ENABLED=true
 ENV DD_LOG_LEVEL=debug
 
-# Start script that runs both agent and log rotator
 COPY start.sh /start.sh
 RUN chmod +x /start.sh
 
 CMD ["/start.sh"]
+EOF
 ```
 
 ### 3. Create docker-compose.yml
 
-```yaml
+```bash
+cat > docker-compose.yml <<'EOF'
 version: '3.8'
 
 services:
@@ -84,47 +83,42 @@ services:
       - DD_SITE=datadoghq.com
       - DD_LOGS_ENABLED=true
       - DD_LOG_LEVEL=debug
-      - DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL=false
     volumes:
       - ./logs:/var/log/app
       - ./agent-logs:/var/log/datadog
     stdin_open: true
     tty: true
+EOF
 ```
 
 ### 4. Create start.sh
 
 ```bash
+cat > start.sh <<'EOF'
 #!/bin/bash
-
-# Start the log rotator in the background
 /usr/local/bin/log-rotator.sh &
-
-# Start the Datadog Agent in the foreground
 exec /bin/entrypoint.sh
+EOF
+chmod +x start.sh
 ```
 
 ### 5. Create log-rotator.sh
 
 ```bash
+cat > log-rotator.sh <<'EOF'
 #!/bin/bash
-
 LOG_DIR="/var/log/app"
 FILE_COUNTER=1
 
 echo "LOG ROTATION DEMO STARTED"
 echo "New log file every 60 seconds"
-echo ""
 
-# Function to create and write to a log file
 create_and_write_log() {
     local filename="app-$(date +%Y%m%d-%H%M%S).log"
     local filepath="${LOG_DIR}/${filename}"
     
-    echo "[$(date '+%H:%M:%S')] ROTATION #${FILE_COUNTER}"
-    echo "Creating: ${filename}"
+    echo "[$(date '+%H:%M:%S')] ROTATION #${FILE_COUNTER}: ${filename}"
     
-    # Write logs for 60 seconds
     local end_time=$(($(date +%s) + 60))
     local line_counter=1
     
@@ -135,27 +129,27 @@ create_and_write_log() {
         sleep 1
     done
     
-    echo "Finished writing to ${filename}: ${line_counter} lines"
-    echo ""
+    echo "Finished: ${filename} (${line_counter} lines)"
     FILE_COUNTER=$((FILE_COUNTER + 1))
 }
 
-# Wait for agent to start
 sleep 15
-
 echo "Starting log rotation cycle..."
 
-# Run forever
 while true; do
     create_and_write_log
-    echo "ROTATING LOG FILE - Agent should detect new file within 5 seconds"
+    echo "ROTATING - New file in 2 seconds..."
     sleep 2
 done
+EOF
+chmod +x log-rotator.sh
 ```
 
 ### 6. Create conf.d/app_logs.yaml
 
-```yaml
+```bash
+mkdir -p conf.d
+cat > conf.d/app_logs.yaml <<'EOF'
 logs:
   - type: file
     path: /var/log/app/app-*.log
@@ -163,13 +157,15 @@ logs:
     source: custom
     sourcecategory: application
     start_position: end
+EOF
 ```
 
 ## Test Case 1: With `open_files_limit: 1`
 
 ### Create datadog.yaml (Case 1)
 
-```yaml
+```bash
+cat > datadog.yaml <<'EOF'
 api_key: dummy_key_for_testing
 site: datadoghq.com
 hostname: rotation-demo-host
@@ -179,15 +175,15 @@ log_level: debug
 
 logs_config:
   file_wildcard_selection_mode: by_modification_time
-  open_files_limit: 1  # FORCE LIMIT
+  open_files_limit: 1  # FORCE LIMIT - only 1 file at a time
   file_scan_period: 5.0
   auditor_ttl: 1
 
 process_config:
   enabled: false
-
 apm_config:
   enabled: false
+EOF
 ```
 
 ### Run Test Case 1
@@ -196,25 +192,51 @@ apm_config:
 docker-compose up --build
 ```
 
-### Expected Behavior (Case 1)
-
-In another terminal, watch the agent logs:
+### Wait for ready
 
 ```bash
+# Wait 20 seconds for agent startup and first rotation
+sleep 20
+```
+
+## Test Commands
+
+### Watch tailer behavior (Case 1)
+
+```bash
+# In another terminal
 docker exec -it datadog-rotation-demo tail -f /var/log/datadog/agent.log | grep -E "After stopping tailers|Starting a new tailer|Closed"
 ```
 
-**Result:** ✅ Old files ARE dropped
+### Expected Output (Case 1)
 
 ```
-After stopping tailers, there are 0 tailers running.  ← OLD TAILER STOPPED
+After stopping tailers, there are 0 tailers running.  ← OLD TAILER STOPPED!
 Starting a new tailer for: /var/log/app/app-20260211-145731.log
-Closed /var/log/app/app-20260211-145629.log  ← OLD FILE CLOSED
+Closed /var/log/app/app-20260211-145629.log  ← OLD FILE CLOSED!
+```
+
+### Count tailers
+
+```bash
+docker exec -it datadog-rotation-demo tail -f /var/log/datadog/agent.log | grep "tailers running. Limit"
+```
+
+### Check registry
+
+```bash
+docker exec -it datadog-rotation-demo cat /opt/datadog-agent/run/registry.json | jq
+```
+
+### List log files
+
+```bash
+ls -lht logs/
 ```
 
 ## Test Case 2: With Default `open_files_limit: 500`
 
-### Stop Current Test
+### Stop current container
 
 ```bash
 docker-compose down
@@ -222,7 +244,8 @@ docker-compose down
 
 ### Create datadog.yaml (Case 2)
 
-```yaml
+```bash
+cat > datadog.yaml <<'EOF'
 api_key: dummy_key_for_testing
 site: datadoghq.com
 hostname: rotation-demo-host
@@ -232,15 +255,15 @@ log_level: debug
 
 logs_config:
   file_wildcard_selection_mode: by_modification_time
-  # NO open_files_limit - uses default 500
+  # NO open_files_limit set - uses default 500
   file_scan_period: 5.0
   auditor_ttl: 1
 
 process_config:
   enabled: false
-
 apm_config:
   enabled: false
+EOF
 ```
 
 ### Run Test Case 2
@@ -249,15 +272,13 @@ apm_config:
 docker-compose up --build
 ```
 
-### Expected Behavior (Case 2)
-
-Watch tailer counts:
+### Watch tailer count increase
 
 ```bash
 docker exec -it datadog-rotation-demo tail -f /var/log/datadog/agent.log | grep "tailers running. Limit"
 ```
 
-**Result:** ❌ Old files are NOT dropped
+### Expected Output (Case 2)
 
 ```
 After starting new tailers, there are 3 tailers running. Limit is 500.
@@ -266,71 +287,40 @@ After starting new tailers, there are 5 tailers running. Limit is 500.  ← ROTA
 After starting new tailers, there are 6 tailers running. Limit is 500.  ← ROTATION #3
 ```
 
-The agent keeps adding tailers and never drops old ones!
-
-## Test Commands
-
-### Agent Status
-
-```bash
-# Check agent logs
-docker exec -it datadog-rotation-demo tail -f /var/log/datadog/agent.log
-
-# Count active tailers
-docker exec -it datadog-rotation-demo tail -f /var/log/datadog/agent.log | grep "tailers running"
-
-# See tailer start/stop events
-docker exec -it datadog-rotation-demo tail -f /var/log/datadog/agent.log | grep -E "Starting a new tailer|stop all tailers|Closed"
-
-# Check registry
-docker exec -it datadog-rotation-demo cat /opt/datadog-agent/run/registry.json | jq
-```
-
-### Log Files
-
-```bash
-# List generated log files
-ls -lht logs/
-
-# Count log files
-ls logs/*.log | wc -l
-
-# Check file sizes
-du -h logs/
-```
+The agent **never drops old files** - it keeps all of them!
 
 ## Expected vs Actual
 
-| Configuration | Expected Old Files Behavior | Actual |
-|--------------|----------------------------|--------|
-| `by_modification_time` only | ❌ Assumes drops old files | ❌ Keeps ALL files until limit |
-| `by_modification_time` + `open_files_limit: 1` | ✅ Drops old files | ✅ Drops old files immediately |
+| Configuration | Expected | Actual |
+|--------------|----------|--------|
+| `by_modification_time` only | ❌ Drops old files? | ❌ Keeps ALL files until limit 500 |
+| `by_modification_time` + `open_files_limit: 1` | ✅ Drops old files | ✅ Drops immediately |
 | `by_modification_time` + `open_files_limit: 10` | ✅ Keeps 10 newest | ✅ Keeps 10 newest |
 
-### Screenshots - Case 1 (open_files_limit: 1)
+### Screenshots - Test Case 1 (limit: 1)
 
 ```
-[14:57:31] 📝 ROTATION #2
+[14:57:31] ROTATION #2: app-20260211-145731.log
 After stopping tailers, there are 0 tailers running.
 Starting a new tailer for: /var/log/app/app-20260211-145731.log
 Closed /var/log/app/app-20260211-145629.log read 5491 bytes and 60 lines
 ```
 
-### Screenshots - Case 2 (default limit: 500)
+### Screenshots - Test Case 2 (default: 500)
 
 ```
-[15:00:08] 📝 ROTATION #1
+[15:00:08] ROTATION #1: app-20260211-150008.log
 After starting new tailers, there are 4 tailers running. Limit is 500.
 
-[15:01:10] 📝 ROTATION #2  
+[15:01:10] ROTATION #2: app-20260211-150110.log
 After starting new tailers, there are 5 tailers running. Limit is 500.
 ```
 
 ## Fix / Workaround
 
-**Problem:** Customer complains about too many old rotated logs being tailed, causing high resource usage.
+**Problem:** Customer complains about too many old rotated logs being tailed, causing high CPU/memory/disk I/O.
 
-**Incorrect Solution (doesn't work):**
+**Incorrect Solution:**
 ```yaml
 logs_config:
   file_wildcard_selection_mode: by_modification_time  # NOT ENOUGH!
@@ -340,49 +330,54 @@ logs_config:
 ```yaml
 logs_config:
   file_wildcard_selection_mode: by_modification_time
-  open_files_limit: 10  # Adjust based on actual active logs
-  auditor_ttl: 6  # Clean up registry faster
+  open_files_limit: 10  # Adjust based on active logs needed
+  auditor_ttl: 6  # Clean up registry faster (hours)
 ```
 
 This ensures:
 - Only the 10 most recent log files are actively tailed
-- Older rotated logs are automatically dropped
-- Registry entries cleaned up after 6 hours instead of 23
+- Older rotated logs are automatically dropped from tailing
+- Registry entries cleaned up after 6 hours instead of 23h
 
 ## Troubleshooting
 
-### Agent Not Dropping Old Files
+### Agent not dropping old files
 
-**Symptom:** Tailer count keeps increasing
+```bash
+# Check current limit
+docker exec -it datadog-rotation-demo grep open_files_limit /etc/datadog-agent/datadog.yaml
+
+# Check tailer count over time
+docker exec -it datadog-rotation-demo tail -f /var/log/datadog/agent.log | grep "tailers running"
+```
 
 **Cause:** No `open_files_limit` set (defaults to 500)
 
 **Fix:** Set `open_files_limit` to reasonable number
 
-### Agent Dropping Active Files
-
-**Symptom:** Recently active files being dropped
-
-**Cause:** `open_files_limit` too low
-
-**Fix:** Increase `open_files_limit` or reduce number of active log files
-
-### Check Current Configuration
+### Check agent configuration
 
 ```bash
-docker exec -it datadog-rotation-demo cat /etc/datadog-agent/datadog.yaml
+docker exec -it datadog-rotation-demo agent config | grep -A5 logs_config
+```
+
+### Check agent status
+
+```bash
+docker exec -it datadog-rotation-demo agent status
 ```
 
 ## Cleanup
 
 ```bash
 docker-compose down
-rm -rf logs/ agent-logs/
+cd ..
+rm -rf file-wildcard-rotation-demo
 ```
 
 ## References
 
-- [Datadog Agent Configuration](https://docs.datadoghq.com/agent/configuration/)
-- [Log Collection Configuration](https://docs.datadoghq.com/agent/logs/)
+- [Datadog Log Collection Configuration](https://docs.datadoghq.com/agent/logs/)
+- [Advanced Log Collection](https://docs.datadoghq.com/agent/logs/advanced_log_collection/)
+- [Agent Configuration](https://docs.datadoghq.com/agent/configuration/)
 - [Agent Docker Tags](https://hub.docker.com/r/datadog/agent/tags)
-- [file_wildcard_selection_mode Documentation](https://docs.datadoghq.com/agent/logs/advanced_log_collection/)
