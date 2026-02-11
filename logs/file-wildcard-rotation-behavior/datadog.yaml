@@ -1,0 +1,29 @@
+api_key: dummy_key_for_testing
+site: datadoghq.com
+hostname: rotation-demo-host
+
+# Enable logs collection
+logs_enabled: true
+
+# Debug logging to see what's happening
+log_level: debug
+
+# Key configuration for this demo
+logs_config:
+  # Use modification time to prioritize newest files
+  file_wildcard_selection_mode: by_modification_time
+  
+  # Using default open_files_limit (500) - not set explicitly
+  
+  # Scan every 5 seconds (faster than default 10s for demo)
+  file_scan_period: 5.0
+  
+  # Reduce auditor TTL to 1 hour (from default 23h)
+  auditor_ttl: 1
+
+# Disable checks we don't need for this demo
+process_config:
+  enabled: false
+
+apm_config:
+  enabled: false

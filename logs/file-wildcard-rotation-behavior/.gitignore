@@ -1,0 +1,6 @@
+# Runtime directories
+logs/
+agent-logs/
+
+# Docker
+.dockerignore
