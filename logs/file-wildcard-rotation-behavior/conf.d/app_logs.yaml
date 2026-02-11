@@ -1,8 +1,0 @@
-logs:
-  - type: file
-    path: /var/log/app/app-*.log
-    service: demo-app
-    source: custom
-    sourcecategory: application
-    # Start from end for new files (don't backfill old logs)
-    start_position: end
