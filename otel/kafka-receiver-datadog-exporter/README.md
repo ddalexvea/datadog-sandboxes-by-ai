@@ -333,6 +333,8 @@ Check Datadog Log Explorer or Live Tail:
 - Filter: `service:myapp`
 - You should see 30 log entries (the 20 "other-service" messages are filtered out)
 
+![Datadog Log Explorer showing 30 myapp logs received via Kafka -> OTel Collector pipeline](datadog-ui-log-explorer.png)
+
 ### Describe pod
 
 ```bash
