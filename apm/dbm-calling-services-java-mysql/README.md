@@ -571,12 +571,12 @@ Key fields to verify:
 
 | Field | Expected | Why it matters |
 |-------|----------|----------------|
-| `version` | >= 1.11.0 | DBM propagation requires dd-java-agent >= 1.11.0 |
 | `service` | Your service name | Must match what appears in APM |
 | `agent_url` | `http://<host>:8126` | Tracer must reach the Datadog Agent |
 | `agent_error` | `false` | `true` = tracer can't reach Agent |
 | `debug` | `false` | `true` when debug mode is active |
-| `sample_rate` | `1.0` | Traces must be sampled to correlate |
+| `profiling_enabled` | `true`/`false` | Whether profiling is active |
+| `sampling_rules` | `[{},{}]` | Controls trace sampling behavior |
 
 ### Tracer Debug Logs
 
@@ -585,18 +585,19 @@ Enable temporarily to see DBM propagation in action:
 ```bash
 kubectl -n dbm-sandbox set env deployment/dbm-demo-app DD_TRACE_DEBUG=true
 
-# Wait ~60s for restart, then check
+# Wait 2-3 min for restart (init containers rebuild the app)
+kubectl -n dbm-sandbox wait --for=condition=available deployment/dbm-demo-app --timeout=180s
 APP_POD=$(kubectl -n dbm-sandbox get pods -l app=dbm-demo-app -o jsonpath='{.items[0].metadata.name}')
-kubectl -n dbm-sandbox logs $APP_POD -c dbm-demo-app --tail=100 | grep "dd.trace"
+kubectl -n dbm-sandbox logs $APP_POD -c dbm-demo-app --tail=200 | grep "datadog.trace"
 
 # Disable (important!)
 kubectl -n dbm-sandbox set env deployment/dbm-demo-app DD_TRACE_DEBUG-
 ```
 
-Look for `_dd.dbm_trace_injected=true` in `mysql.query` spans:
+Look for spans with `_dd.dbm_trace_injected` in the debug output:
 
 ```
-DEBUG datadog.trace.agent.core.DDSpan - Finished span:
+[main] DEBUG datadog.trace.agent.ot.DDSpan - Finished: DDSpan [ t_id=<trace id>, s_id=<span id>, p_id=<parent id>]
   trace=mysql/mysql.query/SELECT * FROM users ...
   tags={_dd.dbm_trace_injected=true, db.type=mysql, db.instance=demo, ...}
 ```
@@ -640,7 +641,7 @@ kubectl -n dbm-sandbox exec $MYSQL_POD -- mysql -uroot -prootpassword \
 | Step | Command | What to check |
 |------|---------|---------------|
 | 1. Tracer loaded? | `kubectl logs <app-pod> \| grep "DATADOG TRACER CONFIGURATION"` | Startup log exists, `agent_error: false` |
-| 2. Tracer version? | Same as above, check `version` field | Must be >= 1.11.0 |
+| 2. Tracer version? | Check JAR: `java -jar dd-java-agent.jar` | Must be >= 1.11.0 (dd-trace-java) |
 | 3. DBM propagation? | Check startup log or `DD_DBM_PROPAGATION_MODE` env var | Must be `full` |
 | 4. Traces reaching Agent? | `agent status` > APM Agent section | `Traces received` count > 0 |
 | 5. DBM check running? | `agent status` > mysql section | `dbm: true`, Query Samples > 0 |
