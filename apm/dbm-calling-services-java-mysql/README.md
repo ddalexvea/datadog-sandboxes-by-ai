@@ -731,31 +731,129 @@ SQL_TEXT: /*ddps='dbm-demo-app',dddbs='mysql',ddh='mysql.dbm-sandbox.svc.cluster
 | `ddpv` | Calling service version |
 | `traceparent` | W3C trace context (trace ID + span ID) |
 
-## Troubleshooting
+## Troubleshooting DBM + APM Correlation
 
-| Step | Command | What to check |
-|------|---------|---------------|
-| 1. Tracer loaded? | `kubectl logs <app-pod> \| grep "DATADOG TRACER CONFIGURATION"` | Startup log exists, `agent_error: false` |
-| 2. Tracer version? | Same as above, check `version` field | Must be >= 1.11.0 (dd-trace-java) |
-| 3. DBM propagation? | Check startup log or `DD_DBM_PROPAGATION_MODE` env var | Must be `full` |
-| 4. Traces reaching Agent? | `agent status` > APM Agent section | `Traces received` count > 0 |
-| 5. DBM check running? | `agent status` > mysql section | `dbm: true`, Query Samples > 0 |
-| 6. SQL comments? | Query `performance_schema.events_statements_history` | Look for `ddps=`, `traceparent=` |
-| 7. Proxy stripping? | Check if ProxySQL/PgBouncer sits between app and DB | Comments may be removed |
+Follow these steps **in order**. Each step depends on the previous one working.
+
+### Step 1: Is the tracer loaded?
 
 ```bash
-kubectl logs -n dbm-sandbox -l app=dbm-demo-app -c dbm-demo-app --tail=100
-kubectl logs -n dbm-sandbox -l app=mysql --tail=100
+APP_POD=$(kubectl -n dbm-sandbox get pods -l app=dbm-demo-app -o jsonpath='{.items[0].metadata.name}')
+kubectl -n dbm-sandbox logs $APP_POD -c dbm-demo-app | grep "DATADOG TRACER CONFIGURATION"
+```
 
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| No output at all | Tracer JAR not attached | Add `-javaagent:/path/to/dd-java-agent.jar` to JVM args |
+| `agent_error: true` | Tracer can't reach Agent | Check `DD_AGENT_HOST`, verify Agent pod is running, check port 8126 reachability |
+| `version` < 1.11.0 | Tracer too old for DBM propagation | Update to dd-java-agent >= 1.11.0 (recommend latest) |
+
+### Step 2: Is DBM propagation enabled?
+
+```bash
+# Check via startup log
+kubectl -n dbm-sandbox logs $APP_POD -c dbm-demo-app | grep "DATADOG TRACER CONFIGURATION" \
+  | sed 's/.*DATADOG TRACER CONFIGURATION //' \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print('sample_rate:', d.get('sample_rate'), '| version:', d.get('version'))"
+
+# Check env var on the deployment
+kubectl -n dbm-sandbox get deployment dbm-demo-app -o jsonpath='{.spec.template.spec.containers[0].args}' | tr ',' '\n' | grep dbm
+```
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| No `dd.dbm.propagation.mode` in args/env | Propagation not configured | Add `-Ddd.dbm.propagation.mode=full` to JVM args or `DD_DBM_PROPAGATION_MODE=full` env var |
+| Mode is `service` instead of `full` | Only service name injected, no trace correlation | Change to `full` for trace-level correlation |
+| `sample_rate: 0` or very low | Traces dropped before correlation | Set `-Ddd.trace.sample.rate=1` or increase sampling |
+
+### Step 3: Are SQL comments being injected?
+
+```bash
+MYSQL_POD=$(kubectl -n dbm-sandbox get pods -l app=mysql -o jsonpath='{.items[0].metadata.name}')
+kubectl -n dbm-sandbox exec $MYSQL_POD -- mysql -uroot -prootpassword \
+  -e "SELECT SQL_TEXT FROM performance_schema.events_statements_history WHERE SQL_TEXT LIKE '%ddps%' LIMIT 3\G"
+```
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| No `ddps=` in queries | Propagation not working | Go back to Step 2; also enable debug logs to confirm `_dd.dbm_trace_injected=true` |
+| `ddps=` present but no `traceparent=` | Mode is `service` not `full` | Set `dd.dbm.propagation.mode=full` |
+| Comments appear locally but not in DBM UI | Proxy stripping comments | ProxySQL, HAProxy, MaxScale, or MySQL Router may strip SQL comments -- check proxy config |
+| Prepared statements with no comments (Java < 1.44) | Old tracer limitation | Update dd-java-agent >= 1.44.0 for prepared statement support; below 1.44, prepared statements auto-downgrade to `service` mode |
+
+### Step 4: Is the Datadog Agent collecting DBM data?
+
+```bash
 AGENT_POD=$(kubectl -n dbm-sandbox get pods -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
-kubectl -n dbm-sandbox logs $AGENT_POD -c agent --tail=100
+kubectl -n dbm-sandbox exec $AGENT_POD -c agent -- agent status | grep -A 30 "mysql"
+```
 
-kubectl describe pod -n dbm-sandbox -l app=dbm-demo-app
-kubectl describe pod -n dbm-sandbox -l app=mysql
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| No `mysql` check in `agent status` | Autodiscovery not picking up annotations | Use v1 annotation format: `ad.datadoghq.com/<container>.check_names`, `.init_configs`, `.instances` |
+| `dbm: false` or missing | DBM not enabled in check config | Add `"dbm": true` to the instance annotations |
+| `Query Samples: 0` | `performance_schema` not enabled | Start MySQL with `--performance-schema=ON` and enable consumers (see below) |
+| `Error initialising check: temporary failure in kubeutil` | Agent can't reach Kubelet (common in minikube) | Add `kubelet.tlsVerify: false` in Helm values |
+| `events-waits-current-not-enabled` warning | Missing performance_schema consumer | Run `UPDATE performance_schema.setup_consumers SET ENABLED = 'YES' WHERE NAME = 'events_waits_current';` or add `--performance-schema-consumer-events-waits-current=ON` to MySQL args |
 
-kubectl get events -n dbm-sandbox --sort-by='.lastTimestamp'
-kubectl get pods -n dbm-sandbox -o wide
-kubectl get svc -n dbm-sandbox
+### Step 5: Are APM traces reaching the Agent?
+
+```bash
+kubectl -n dbm-sandbox exec $AGENT_POD -c agent -- agent status | grep -A 15 "APM Agent"
+```
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `Traces received: 0` | Tracer can't reach Agent | Check `DD_AGENT_HOST` points to node IP (`status.hostIP`), verify port 8126 is open |
+| No `APM Agent` section | APM not enabled on Agent | Add `apm.portEnabled: true` in Helm values |
+| Traces received but no correlation in UI | DBM and APM data not linked | Ensure `DD_SERVICE`, `DD_ENV` are consistent between tracer and Agent |
+
+### Step 6: Is the Calling Services column populated in the UI?
+
+After all previous steps pass, wait 5-10 minutes then check:
+- **DBM > Query Samples**: Look for the "Calling Services" column
+- **APM > Traces**: Filter by `service:dbm-demo-app` and look for `mysql.query` spans
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Calling Services empty | Data not yet propagated | Wait 5-10 min; DBM samples are collected periodically |
+| Calling Services shows `other` | Service name mismatch | Ensure `DD_SERVICE` / `-Ddd.service` matches what APM reports |
+| Only `service` mode data (no trace link) | `traceparent` not in SQL comments | Upgrade to `full` mode and tracer >= 1.11.0 |
+
+### Quick Diagnostic Commands
+
+```bash
+APP_POD=$(kubectl -n dbm-sandbox get pods -l app=dbm-demo-app -o jsonpath='{.items[0].metadata.name}')
+AGENT_POD=$(kubectl -n dbm-sandbox get pods -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+MYSQL_POD=$(kubectl -n dbm-sandbox get pods -l app=mysql -o jsonpath='{.items[0].metadata.name}')
+
+# 1. Tracer startup
+kubectl -n dbm-sandbox logs $APP_POD -c dbm-demo-app | grep "DATADOG TRACER CONFIGURATION"
+
+# 2. Agent MySQL check
+kubectl -n dbm-sandbox exec $AGENT_POD -c agent -- agent status | grep -A 30 "mysql"
+
+# 3. Agent APM
+kubectl -n dbm-sandbox exec $AGENT_POD -c agent -- agent status | grep -A 15 "APM Agent"
+
+# 4. Autodiscovery
+kubectl -n dbm-sandbox exec $AGENT_POD -c agent -- agent configcheck | grep -A 25 "mysql"
+
+# 5. SQL comments in MySQL
+kubectl -n dbm-sandbox exec $MYSQL_POD -- mysql -uroot -prootpassword \
+  -e "SELECT SQL_TEXT FROM performance_schema.events_statements_history WHERE SQL_TEXT LIKE '%ddps%' LIMIT 3\G"
+
+# 6. Debug logs (enable temporarily)
+kubectl -n dbm-sandbox set env deployment/dbm-demo-app DD_TRACE_DEBUG=true
+# wait 2-3 min, then:
+kubectl -n dbm-sandbox logs $(kubectl -n dbm-sandbox get pods -l app=dbm-demo-app -o jsonpath='{.items[0].metadata.name}') -c dbm-demo-app --tail=500 | grep "dbm_trace_injected"
+# disable:
+kubectl -n dbm-sandbox set env deployment/dbm-demo-app DD_TRACE_DEBUG-
+
+# 7. Pod logs / events
+kubectl logs -n dbm-sandbox $APP_POD -c dbm-demo-app --tail=50
+kubectl -n dbm-sandbox logs $AGENT_POD -c agent --tail=50
+kubectl get events -n dbm-sandbox --sort-by='.lastTimestamp' | tail -20
 ```
 
 ## Cleanup
