@@ -567,16 +567,45 @@ kubectl -n dbm-sandbox logs $APP_POD -c dbm-demo-app \
   | python3 -m json.tool
 ```
 
+<details>
+<summary>Sample output (click to expand)</summary>
+
+Raw line:
+
+```
+[dd.trace 2026-02-24 16:01:49:441 +0000] [dd-task-scheduler] INFO datadog.trace.agent.core.StatusLogger - DATADOG TRACER CONFIGURATION {"version":"1.59.0~7e1bb03bc3","os_name":"Linux","os_version":"6.8.0-47-generic","architecture":"aarch64","lang":"jvm","lang_version":"17.0.18","jvm_vendor":"Eclipse Adoptium","jvm_version":"17.0.18+8","java_class_version":"61.0","http_nonProxyHosts":"null","http_proxyHost":"null","enabled":true,"service":"dbm-demo-app","agent_url":"http://192.168.67.2:8126","agent_error":false,"debug":false,"trace_propagation_style_extract":["datadog","tracecontext","baggage"],"trace_propagation_style_inject":["datadog","tracecontext","baggage"],"analytics_enabled":false,"sample_rate":1.0,"priority_sampling_enabled":true,"logs_correlation_enabled":true,"profiling_enabled":true,"remote_config_enabled":true,"debugger_enabled":false,"appsec_enabled":"ENABLED_INACTIVE","telemetry_enabled":true,"dd_version":"1.0.0","health_checks_enabled":true,"configuration_file":"no config file present","runtime_id":"91b89019-754e-484c-b562-0b3a9958464b","cws_enabled":false,"datadog_profiler_enabled":true,"data_streams_enabled":false}
+```
+
+Pretty-printed (key fields):
+
+```json
+{
+    "version": "1.59.0~7e1bb03bc3",
+    "service": "dbm-demo-app",
+    "agent_url": "http://192.168.67.2:8126",
+    "agent_error": false,
+    "debug": false,
+    "sample_rate": 1.0,
+    "logs_correlation_enabled": true,
+    "profiling_enabled": true,
+    "dd_version": "1.0.0",
+    "trace_propagation_style_inject": ["datadog", "tracecontext", "baggage"]
+}
+```
+
+</details>
+
 Key fields to verify:
 
 | Field | Expected | Why it matters |
 |-------|----------|----------------|
+| `version` | >= 1.11.0 | DBM propagation requires dd-java-agent >= 1.11.0 |
 | `service` | Your service name | Must match what appears in APM |
 | `agent_url` | `http://<host>:8126` | Tracer must reach the Datadog Agent |
 | `agent_error` | `false` | `true` = tracer can't reach Agent |
 | `debug` | `false` | `true` when debug mode is active |
+| `sample_rate` | `1.0` | Traces must be sampled to correlate |
 | `profiling_enabled` | `true`/`false` | Whether profiling is active |
-| `sampling_rules` | `[{},{}]` | Controls trace sampling behavior |
 
 ### Tracer Debug Logs
 
@@ -588,19 +617,73 @@ kubectl -n dbm-sandbox set env deployment/dbm-demo-app DD_TRACE_DEBUG=true
 # Wait 2-3 min for restart (init containers rebuild the app)
 kubectl -n dbm-sandbox wait --for=condition=available deployment/dbm-demo-app --timeout=180s
 APP_POD=$(kubectl -n dbm-sandbox get pods -l app=dbm-demo-app -o jsonpath='{.items[0].metadata.name}')
-kubectl -n dbm-sandbox logs $APP_POD -c dbm-demo-app --tail=200 | grep "datadog.trace"
+
+# Wait ~15s for traffic to generate, then check
+sleep 15
+kubectl -n dbm-sandbox logs $APP_POD -c dbm-demo-app --tail=500 | grep "dbm_trace_injected"
 
 # Disable (important!)
 kubectl -n dbm-sandbox set env deployment/dbm-demo-app DD_TRACE_DEBUG-
 ```
 
-Look for spans with `_dd.dbm_trace_injected` in the debug output:
+<details>
+<summary>Sample output -- DBM propagation working (click to expand)</summary>
+
+Look for `_dd.dbm_trace_injected=true` in `mysql.query` spans:
 
 ```
-[main] DEBUG datadog.trace.agent.ot.DDSpan - Finished: DDSpan [ t_id=<trace id>, s_id=<span id>, p_id=<parent id>]
-  trace=mysql/mysql.query/SELECT * FROM users ...
-  tags={_dd.dbm_trace_injected=true, db.type=mysql, db.instance=demo, ...}
+[dd.trace 2026-02-24 20:04:58:110 +0000] [scheduling-1] DEBUG datadog.trace.agent.core.DDSpan - Finished span (PENDING):
+  DDSpan [ t_id=2512113318700459080, s_id=2876541410531293108, p_id=4984798654273901988 ]
+  trace=mysql/mysql.query/SELECT * FROM users ORDER BY created_at DESC LIMIT ? *measured*
+  tags={
+    _dd.dbm_trace_injected=true,
+    component=java-jdbc-statement,
+    db.instance=demo,
+    db.operation=SELECT,
+    db.pool.name=HikariPool-1,
+    db.type=mysql,
+    db.user=appuser,
+    env=sandbox,
+    peer.hostname=mysql.dbm-sandbox.svc.cluster.local,
+    span.kind=client,
+    thread.id=53,
+    thread.name=scheduling-1,
+    version=1.0.0
+  }, duration_ns=3534589
 ```
+
+```
+[dd.trace 2026-02-24 20:04:58:118 +0000] [scheduling-1] DEBUG datadog.trace.agent.core.DDSpan - Finished span (PENDING):
+  DDSpan [ t_id=2512113318700459080, s_id=6874538426310434795, p_id=4984798654273901988 ]
+  trace=mysql/mysql.query/SELECT COUNT(*) as total FROM users *measured*
+  tags={
+    _dd.dbm_trace_injected=true,
+    component=java-jdbc-statement,
+    db.instance=demo,
+    db.operation=SELECT,
+    db.type=mysql,
+    env=sandbox,
+    peer.hostname=mysql.dbm-sandbox.svc.cluster.local
+  }, duration_ns=5129447
+```
+
+The parent span shows the trace being serialized and sent to the Agent:
+
+```
+[dd.trace 2026-02-24 20:04:58:121 +0000] [scheduling-1] DEBUG datadog.trace.agent.common.writer.RemoteWriter -
+  Enqueued for serialization: [
+    DDSpan [ t_id=2512113318700459080, s_id=4984798654273901988, p_id=0 ]
+      trace=dbm-demo-app/scheduled.call/DbmDemoApplication.generateTraffic
+      tags={component=spring-scheduling, env=sandbox, language=jvm, ...}
+  ]
+```
+
+</details>
+
+**If `_dd.dbm_trace_injected` is NOT present**, check:
+- `dd.dbm.propagation.mode` is set to `full` (check startup log)
+- The JDBC driver is supported (MySQL Connector/J, PostgreSQL JDBC)
+- The tracer version is >= 1.11.0
 
 ### Verify SQL Comment Propagation
 
@@ -613,6 +696,18 @@ kubectl -n dbm-sandbox exec $MYSQL_POD -- mysql -uroot -prootpassword \
 kubectl -n dbm-sandbox exec $MYSQL_POD -- mysql -uroot -prootpassword \
   -e "SELECT SQL_TEXT FROM performance_schema.events_statements_history WHERE SQL_TEXT LIKE '%ddps%' LIMIT 5\G"
 ```
+
+<details>
+<summary>Sample output (click to expand)</summary>
+
+```
+*************************** 1. row ***************************
+SQL_TEXT: /*ddps='dbm-demo-app',dddbs='mysql',ddh='mysql.dbm-sandbox.svc.cluster.local',dddb='demo',dde='sandbox',ddpv='1.0.0',traceparent='00-699e04b00000000036452636ac40eaeb-3acf725dc74c0f38-01'*/ SELECT * FROM users ORDER BY created_at DESC LIMIT 10
+*************************** 2. row ***************************
+SQL_TEXT: /*ddps='dbm-demo-app',dddbs='mysql',ddh='mysql.dbm-sandbox.svc.cluster.local',dddb='demo',dde='sandbox',ddpv='1.0.0',traceparent='00-699e04b00000000036452636ac40eaeb-6715cfc46540af12-01'*/ SELECT COUNT(*) as total FROM users
+```
+
+</details>
 
 ## Expected vs Actual
 
@@ -641,7 +736,7 @@ kubectl -n dbm-sandbox exec $MYSQL_POD -- mysql -uroot -prootpassword \
 | Step | Command | What to check |
 |------|---------|---------------|
 | 1. Tracer loaded? | `kubectl logs <app-pod> \| grep "DATADOG TRACER CONFIGURATION"` | Startup log exists, `agent_error: false` |
-| 2. Tracer version? | Check JAR: `java -jar dd-java-agent.jar` | Must be >= 1.11.0 (dd-trace-java) |
+| 2. Tracer version? | Same as above, check `version` field | Must be >= 1.11.0 (dd-trace-java) |
 | 3. DBM propagation? | Check startup log or `DD_DBM_PROPAGATION_MODE` env var | Must be `full` |
 | 4. Traces reaching Agent? | `agent status` > APM Agent section | `Traces received` count > 0 |
 | 5. DBM check running? | `agent status` > mysql section | `dbm: true`, Query Samples > 0 |
