@@ -51,11 +51,11 @@ flowchart LR
 ```bash
 # 1. Confirm resources/ is empty (no prior import)
 $ ls /tmp/sync-sandbox/
-configprod
+config
 
 # 2. Run diffs WITHOUT import → zero diff output
 $ docker run --rm -v /tmp/sync-sandbox:/datadog-sync:rw \
-    datadog-sync diffs --config configprod --resources="dashboards" --verify-ddr-status=false
+    datadog-sync diffs --config /datadog-sync/config --resources="dashboards" --verify-ddr-status=false
 
 2026-02-26 16:17:31 - INFO - clients validated successfully
 2026-02-26 16:17:31 - WARNING - DDR verification skipped.
@@ -65,7 +65,7 @@ $ docker run --rm -v /tmp/sync-sandbox:/datadog-sync:rw \
 
 # 3. Run import → pulls 13 dashboards from source API
 $ docker run --rm -v /tmp/sync-sandbox:/datadog-sync:rw \
-    datadog-sync import --config configprod --resources="dashboards" --verify-ddr-status=false
+    datadog-sync import --config /datadog-sync/config --resources="dashboards" --verify-ddr-status=false
 
 2026-02-26 16:17:41 - INFO - Finished getting resources. Successes: 1, Failures: 0
 2026-02-26 16:17:42 - INFO - finished importing individual resource items: Successes: 13, Failures: 0
@@ -77,7 +77,7 @@ dashboards.json
 
 # 5. Run diffs AFTER import → shows all 13 dashboards
 $ docker run --rm -v /tmp/sync-sandbox:/datadog-sync:rw \
-    datadog-sync diffs --config configprod --resources="dashboards" --verify-ddr-status=false
+    datadog-sync diffs --config /datadog-sync/config --resources="dashboards" --verify-ddr-status=false
 
 2026-02-26 16:17:58 - INFO - Starting diffs...
 2026-02-26 16:17:58 - INFO - to be created: dashboards yyn-guv-vqe
@@ -136,7 +136,7 @@ docker build . -t datadog-sync
 ```bash
 mkdir -p /tmp/sync-sandbox
 
-cat > /tmp/sync-sandbox/configprod <<'EOF'
+cat > /tmp/sync-sandbox/config <<'EOF'
 source_api_key="YOUR_SOURCE_API_KEY"
 source_app_key="YOUR_SOURCE_APP_KEY"
 source_api_url="https://api.datadoghq.com"
@@ -148,12 +148,14 @@ EOF
 
 Replace the placeholder keys with real keys. Source and destination can be the same org for testing.
 
+Both relative and absolute config paths work identically (`--config config` and `--config /datadog-sync/config`) since the Dockerfile sets `WORKDIR /datadog-sync` which is the mount point.
+
 ### 4. Reproduce the bug — diffs WITHOUT import
 
 ```bash
 docker run --rm -v /tmp/sync-sandbox:/datadog-sync:rw \
   datadog-sync diffs \
-  --config configprod \
+  --config /datadog-sync/config \
   --resources="dashboards" \
   --verify-ddr-status=false
 ```
@@ -164,14 +166,14 @@ docker run --rm -v /tmp/sync-sandbox:/datadog-sync:rw \
 # Step 1: import
 docker run --rm -v /tmp/sync-sandbox:/datadog-sync:rw \
   datadog-sync import \
-  --config configprod \
+  --config /datadog-sync/config \
   --resources="dashboards" \
   --verify-ddr-status=false
 
 # Step 2: diffs
 docker run --rm -v /tmp/sync-sandbox:/datadog-sync:rw \
   datadog-sync diffs \
-  --config configprod \
+  --config /datadog-sync/config \
   --resources="dashboards" \
   --verify-ddr-status=false
 ```
@@ -223,7 +225,7 @@ cat /tmp/sync-sandbox/resources/source/dashboards.json | python3 -m json.tool | 
 # Verify config is readable inside container
 docker run --rm --entrypoint cat \
   -v /tmp/sync-sandbox:/datadog-sync:rw \
-  datadog-sync /datadog-sync/configprod
+  datadog-sync /datadog-sync/config
 
 # Test with env vars instead of config file
 docker run --rm -v /tmp/sync-sandbox:/datadog-sync:rw \
