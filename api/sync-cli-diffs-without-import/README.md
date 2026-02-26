@@ -19,7 +19,7 @@ This catches users who expect `diffs` to behave like a live comparison between t
 ```mermaid
 flowchart LR
     subgraph "Step 1: import"
-        A[Source Org API] -->|fetch resources| B[resources/source/\ndashboards.json\nmonitors.json]
+        A[Source Org API] -->|fetch resources| B["resources/source/<br/>dashboards.json<br/>monitors.json"]
     end
     subgraph "Step 2: diffs"
         B -->|reads local state| C{Compare}
@@ -33,8 +33,8 @@ flowchart LR
 ```mermaid
 flowchart LR
     subgraph "Step 1: diffs without import"
-        A["resources/source/\n(empty)"] -->|reads local state| B{Compare}
-        B -->|nothing to compare| C["Starting diffs...\nFinished diffs\n(zero output)"]
+        A["resources/source/<br/>(empty)"] -->|reads local state| B{Compare}
+        B -->|nothing to compare| C["Starting diffs...<br/>Finished diffs<br/>(zero output)"]
     end
     style A fill:#ff6b6b,color:#fff
     style C fill:#ff6b6b,color:#fff
