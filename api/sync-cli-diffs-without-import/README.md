@@ -40,6 +40,63 @@ flowchart LR
     style C fill:#ff6b6b,color:#fff
 ```
 
+## Clean Proof
+
+| Step | Command | Result |
+|------|---------|--------|
+| **No `import`** | `diffs` | `Starting diffs... Finished diffs` — **zero output** |
+| **Run `import`** | `import` | `Successes: 13` — creates `resources/source/dashboards.json` |
+| **After `import`** | `diffs` | **13 dashboards listed** as "to be created" |
+
+```bash
+# 1. Confirm resources/ is empty (no prior import)
+$ ls /tmp/sync-sandbox/
+configprod
+
+# 2. Run diffs WITHOUT import → zero diff output
+$ docker run --rm -v /tmp/sync-sandbox:/datadog-sync:rw \
+    datadog-sync diffs --config configprod --resources="dashboards" --verify-ddr-status=false
+
+2026-02-26 16:17:31 - INFO - clients validated successfully
+2026-02-26 16:17:31 - WARNING - DDR verification skipped.
+2026-02-26 16:17:31 - INFO - Starting diffs...
+2026-02-26 16:17:34 - INFO - Finished diffs
+# ^^^ Nothing between "Starting" and "Finished"
+
+# 3. Run import → pulls 13 dashboards from source API
+$ docker run --rm -v /tmp/sync-sandbox:/datadog-sync:rw \
+    datadog-sync import --config configprod --resources="dashboards" --verify-ddr-status=false
+
+2026-02-26 16:17:41 - INFO - Finished getting resources. Successes: 1, Failures: 0
+2026-02-26 16:17:42 - INFO - finished importing individual resource items: Successes: 13, Failures: 0
+2026-02-26 16:17:42 - INFO - Finished import
+
+# 4. Confirm state files now exist
+$ ls /tmp/sync-sandbox/resources/source/
+dashboards.json
+
+# 5. Run diffs AFTER import → shows all 13 dashboards
+$ docker run --rm -v /tmp/sync-sandbox:/datadog-sync:rw \
+    datadog-sync diffs --config configprod --resources="dashboards" --verify-ddr-status=false
+
+2026-02-26 16:17:58 - INFO - Starting diffs...
+2026-02-26 16:17:58 - INFO - to be created: dashboards yyn-guv-vqe
+2026-02-26 16:17:58 - INFO - to be created: dashboards 8g9-3tr-qca
+2026-02-26 16:17:58 - INFO - to be created: dashboards mvn-pgx-as7
+2026-02-26 16:17:58 - INFO - to be created: dashboards i3b-3sx-s24
+2026-02-26 16:17:58 - INFO - to be created: dashboards vmk-k9j-jac
+2026-02-26 16:17:58 - INFO - to be created: dashboards yq8-w7q-smx
+2026-02-26 16:17:58 - INFO - to be created: dashboards i3b-3sx-s24
+2026-02-26 16:17:58 - INFO - to be created: dashboards pi4-nqp-3bp
+2026-02-26 16:17:58 - INFO - to be created: dashboards e8y-hie-2ah
+2026-02-26 16:17:58 - INFO - to be created: dashboards k6f-aju-97e
+2026-02-26 16:17:58 - INFO - to be created: dashboards 7av-hk6-a9q
+2026-02-26 16:17:58 - INFO - to be created: dashboards hk2-wg2-jiv
+2026-02-26 16:17:58 - INFO - to be created: dashboards 7xq-naj-sh5
+2026-02-26 16:17:58 - INFO - Finished diffs
+# ^^^ 13 dashboards listed
+```
+
 ## Source Code Proof
 
 **`diffs` never calls the source API — it only reads local state:**
