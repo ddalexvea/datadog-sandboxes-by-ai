@@ -14,38 +14,30 @@ This catches users who expect `diffs` to behave like a live comparison between t
 
 ## Schema
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     CORRECT WORKFLOW                            │
-│                                                                 │
-│  Step 1: import         Step 2: diffs                           │
-│                                                                 │
-│  Source Org API         resources/source/     Destination Org    │
-│  ┌──────────┐          ┌────────────────┐     ┌──────────────┐  │
-│  │ Fetch    │──────────▶│ dashboards.json│────▶│ Compare with │  │
-│  │ resources│  writes   │ monitors.json  │reads│ dest API     │  │
-│  └──────────┘          └────────────────┘     └──────┬───────┘  │
-│                                                      │          │
-│                                                      ▼          │
-│                                               Shows diffs!      │
-└─────────────────────────────────────────────────────────────────┘
+### Correct Workflow: `import` then `diffs`
 
-┌─────────────────────────────────────────────────────────────────┐
-│                     BUG SCENARIO                                │
-│                                                                 │
-│  Step 1: diffs (WITHOUT import)                                 │
-│                                                                 │
-│  resources/source/          Destination Org                     │
-│  ┌────────────────┐         ┌──────────────┐                    │
-│  │ (empty)        │────────▶│ Nothing to   │                    │
-│  │                │  reads  │ compare      │                    │
-│  └────────────────┘         └──────┬───────┘                    │
-│                                    │                            │
-│                                    ▼                            │
-│                          "Starting diffs...                     │
-│                           Finished diffs"                       │
-│                          (zero output)                          │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph "Step 1: import"
+        A[Source Org API] -->|fetch resources| B[resources/source/\ndashboards.json\nmonitors.json]
+    end
+    subgraph "Step 2: diffs"
+        B -->|reads local state| C{Compare}
+        D[Destination Org API] -->|reads current state| C
+        C -->|differences found| E["Shows diffs!"]
+    end
+```
+
+### Bug Scenario: `diffs` WITHOUT `import`
+
+```mermaid
+flowchart LR
+    subgraph "Step 1: diffs without import"
+        A["resources/source/\n(empty)"] -->|reads local state| B{Compare}
+        B -->|nothing to compare| C["Starting diffs...\nFinished diffs\n(zero output)"]
+    end
+    style A fill:#ff6b6b,color:#fff
+    style C fill:#ff6b6b,color:#fff
 ```
 
 ## Source Code Proof
