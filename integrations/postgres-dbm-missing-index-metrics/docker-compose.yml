@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:14
+    container_name: zd2517041-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: wallet
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  datadog-agent:
+    image: gcr.io/datadoghq/agent:7
+    container_name: zd2517041-agent
+    environment:
+      DD_API_KEY: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      DD_DBM_ENABLED: "true"
+      DD_SITE: "datadoghq.com"
+    volumes:
+      - ./conf-without-relations.yaml:/etc/datadog-agent/conf.d/postgres.d/conf.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy

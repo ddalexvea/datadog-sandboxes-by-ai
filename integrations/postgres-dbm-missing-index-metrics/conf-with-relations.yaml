@@ -1,0 +1,18 @@
+# Fixed config (with relations — resolves the issue)
+# ZD-2517041: Adding relations enables index metric collection
+instances:
+  - host: zd2517041-postgres
+    port: 5432
+    username: datadog
+    password: datadog
+    dbname: wallet
+    dbstrict: true
+    dbm: true
+    collect_schemas:
+      enabled: true
+    relations:
+      - relation_regex: .*
+    tags:
+      - env:sandbox
+      - ticket:2517041
+      - scenario:with-relations

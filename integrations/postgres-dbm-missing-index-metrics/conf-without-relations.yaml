@@ -1,0 +1,16 @@
+# Customer config replica (no relations — reproduces the issue)
+# ZD-2517041: Missing index metrics in DBM Indexes tab
+instances:
+  - host: zd2517041-postgres
+    port: 5432
+    username: datadog
+    password: datadog
+    dbname: wallet
+    dbstrict: true
+    dbm: true
+    collect_schemas:
+      enabled: true
+    tags:
+      - env:sandbox
+      - ticket:2517041
+      - scenario:without-relations
