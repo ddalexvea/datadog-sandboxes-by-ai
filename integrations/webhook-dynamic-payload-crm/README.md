@@ -1,70 +1,155 @@
-# Webhook Dynamic Payload — CRM Integration (ZD-2497825)
+# Webhook Dynamic Payload - Double-Serialized JSON with Variable Substitution
 
-Reproduces why a Datadog webhook with dynamic `$VARIABLE` payloads fails to create cases in a CRM endpoint that expects double-serialized JSON (`input_data` is a JSON-string-encoded JSON object).
+## Context
 
-## Root Cause
+Reproduces a failure when using Datadog webhook dynamic variables (`$EVENT_TITLE`, `$TEXT_ONLY_MSG`) inside a double-serialized JSON payload (where the `input_data` field value is itself a JSON-encoded string). Two compounding issues prevent the target API from accepting the request:
 
-Two compounding issues:
+1. Using monitor template syntax (`{{EVENT_TITLE}}`) instead of webhook syntax (`$EVENT_TITLE`) — variables are sent as literal text
+2. Multi-line `$TEXT_ONLY_MSG` expansion inserts newline characters inside the JSON string, producing `Invalid control character` parse errors
 
-1. **Wrong variable syntax**: Customer used `{{EVENT_TITLE}}` (monitor template syntax) instead of `$EVENT_TITLE` (webhook syntax). Datadog sends the `{{...}}` tokens as literal text — no substitution occurs.
-2. **Multi-line `$TEXT_ONLY_MSG` breaks JSON**: Even with correct `$VARIABLE` syntax, the multi-line monitor message expands into newlines inside a JSON string value, producing `Invalid control character` parse errors at the CRM.
+## Environment
 
-## Files
+- **Platform:** Local (Python 3 + curl)
+- **Integration:** Webhooks
+- **Dependencies:** Python 3.x (no external packages)
 
-| File | Purpose |
-|---|---|
-| `simulate_webhook.py` | Simulates Datadog's raw text substitution and tests 4 payload variants |
-| `crm_mock_server.py` | Mock CRM HTTP endpoint that parses double-serialized JSON like the real CRM |
+## Schema
+
+```mermaid
+sequenceDiagram
+    participant DD as Datadog Webhook
+    participant Sub as Variable Substitution
+    participant API as Target CRM API
+
+    DD->>Sub: Payload template with $VARIABLE placeholders
+    Sub->>Sub: Raw text replacement (no JSON escaping)
+    Sub->>API: POST with substituted payload
+
+    Note over API: Parses outer JSON
+    Note over API: Parses inner input_data JSON string
+
+    alt Static payload
+        API-->>DD: 200 OK (case created)
+    end
+    alt Multi-line $TEXT_ONLY_MSG
+        API-->>DD: 400 Invalid control character
+    end
+    alt Single-line $TEXT_ONLY_MSG
+        API-->>DD: 200 OK (case created)
+    end
+```
 
 ## Quick Start
 
-### Option A: Standalone simulation (no server needed)
+### 1. Clone and navigate
+
+```bash
+git clone https://github.com/ddalexvea/datadog-sandboxes-by-ai.git
+cd datadog-sandboxes-by-ai/integrations/webhook-dynamic-payload-crm
+```
+
+### 2. Run standalone simulation (no server needed)
 
 ```bash
 python3 simulate_webhook.py
 ```
 
-Runs 4 tests and prints pass/fail for each payload variant.
+Runs 4 test cases covering all payload variants and prints pass/fail for each.
 
-### Option B: End-to-end with mock CRM server
+### 3. Run end-to-end with mock CRM server
 
 Terminal 1 — start the mock CRM:
+
 ```bash
 python3 crm_mock_server.py
 ```
 
 Terminal 2 — send test payloads:
+
 ```bash
-# Static payload (works)
+# Test 1: Static payload (works)
 curl -s -X POST http://127.0.0.1:8899 \
   -H "Content-Type: application/json" \
   -d '{"input_data": "{\"request\":{\"subject\":\"New Ticket\",\"description\":\"Static test\",\"category\":{\"id\":\"303\",\"name\":\"Business Application\"},\"subcategory\":{\"id\":\"610\",\"name\":\"Mfund Application\"},\"item\":{\"id\":\"2401\",\"name\":\"Duplicate\"},\"priority\":{\"id\":\"904\",\"name\":\"1 Low\"},\"urgency\":{\"id\":\"4\",\"name\":\"Low\"},\"impact\":{\"id\":\"4\",\"name\":\"Affects User\"},\"request_type\":{\"id\":\"1\",\"name\":\"Incident\"},\"requester\":{\"email_id\":\"test@example.com\"},\"status\":{\"name\":\"Open\"},\"template\":{\"id\":\"17802\",\"name\":\"Data Dog\"}}}"}'
 
-# Dynamic payload with multi-line message (fails — 400 Invalid JSON)
+# Test 2: Dynamic payload with multi-line message (fails — 400)
 curl -s -X POST http://127.0.0.1:8899 \
   -H "Content-Type: application/json" \
   -d '{"input_data": "{\"request\":{\"subject\":\"[Triggered] Payment Failure Monitor\",\"description\":\"Payment failure detected\nError: TIMEOUT\nAmount: 5000\",\"category\":{\"id\":\"303\",\"name\":\"Business Application\"},\"subcategory\":{\"id\":\"610\",\"name\":\"Mfund Application\"},\"item\":{\"id\":\"2401\",\"name\":\"Duplicate\"},\"priority\":{\"id\":\"904\",\"name\":\"1 Low\"},\"urgency\":{\"id\":\"4\",\"name\":\"Low\"},\"impact\":{\"id\":\"4\",\"name\":\"Affects User\"},\"request_type\":{\"id\":\"1\",\"name\":\"Incident\"},\"requester\":{\"email_id\":\"test@example.com\"},\"status\":{\"name\":\"Open\"},\"template\":{\"id\":\"17802\",\"name\":\"Data Dog\"}}}"}'
 
-# Dynamic payload with single-line message (works — the fix)
+# Test 3: Dynamic payload with single-line message (works — the fix)
 curl -s -X POST http://127.0.0.1:8899 \
   -H "Content-Type: application/json" \
   -d '{"input_data": "{\"request\":{\"subject\":\"[Triggered] Payment Failure Monitor\",\"description\":\"Alert: APP-12345 | TxnID: TXN-67890 | Status: FAILED | Amount: 5000.00\",\"category\":{\"id\":\"303\",\"name\":\"Business Application\"},\"subcategory\":{\"id\":\"610\",\"name\":\"Mfund Application\"},\"item\":{\"id\":\"2401\",\"name\":\"Duplicate\"},\"priority\":{\"id\":\"904\",\"name\":\"1 Low\"},\"urgency\":{\"id\":\"4\",\"name\":\"Low\"},\"impact\":{\"id\":\"4\",\"name\":\"Affects User\"},\"request_type\":{\"id\":\"1\",\"name\":\"Incident\"},\"requester\":{\"email_id\":\"test@example.com\"},\"status\":{\"name\":\"Open\"},\"template\":{\"id\":\"17802\",\"name\":\"Data Dog\"}}}"}'
 ```
 
-## Expected Output
+## Test Commands
 
-| Test | Result | Reason |
-|---|---|---|
-| Static payload | 200 OK | No variables, no breakage |
-| `{{...}}` syntax | 200 OK* | JSON valid but variables sent as literal text — CRM creates garbage case |
-| `$VAR` + multi-line | 400 Error | Newlines in `$TEXT_ONLY_MSG` break JSON string |
-| `$VAR` + single-line | 200 OK | Correct fix — dynamic data, valid JSON |
+### Standalone simulation
 
-## Fix
+```bash
+python3 simulate_webhook.py
+```
 
-Two changes required:
+### Mock server health check
 
-1. Use `$EVENT_TITLE` and `$TEXT_ONLY_MSG` (not `{{...}}`) in the webhook payload
-2. Flatten the monitor notification message to a single line (pipe-separated format)
+```bash
+curl -s http://127.0.0.1:8899/health
+```
 
-Reference: [Datadog Webhooks Variables](https://docs.datadoghq.com/integrations/webhooks/#variables)
+## Expected vs Actual
+
+| Test Case | Expected | Actual |
+|-----------|----------|--------|
+| Static payload (no variables) | 200 OK, case created | 200 OK |
+| `{{EVENT_TITLE}}` syntax (wrong) | Variables sent as literal text | 200 OK but subject = `{{EVENT_TITLE}}` literally |
+| `$EVENT_TITLE` + multi-line `$TEXT_ONLY_MSG` | 400 JSON parse error | 400 `Invalid control character at: line 1 column 174` |
+| `$EVENT_TITLE` + single-line `$TEXT_ONLY_MSG` | 200 OK, case created with dynamic data | 200 OK |
+
+## Fix / Workaround
+
+Two changes required in the Datadog webhook configuration:
+
+**Change 1 — Use correct variable syntax in the webhook payload:**
+
+```json
+{
+  "input_data": "{\"request\":{\"subject\":\"$EVENT_TITLE\",\"description\":\"$TEXT_ONLY_MSG\",\"category\":{\"id\":\"303\",\"name\":\"Business Application\"},\"subcategory\":{\"id\":\"610\",\"name\":\"Mfund Application\"},\"item\":{\"id\":\"2401\",\"name\":\"Duplicate\"},\"priority\":{\"id\":\"904\",\"name\":\"1 Low\"},\"urgency\":{\"id\":\"4\",\"name\":\"Low\"},\"impact\":{\"id\":\"4\",\"name\":\"Affects User\"},\"request_type\":{\"id\":\"1\",\"name\":\"Incident\"},\"requester\":{\"email_id\":\"requester@example.com\"},\"status\":{\"name\":\"Open\"},\"template\":{\"id\":\"17802\",\"name\":\"Data Dog\"}}}"
+}
+```
+
+**Change 2 — Flatten the monitor notification message to a single line:**
+
+```
+Alert: {{log.attributes.applicationNumber}} | TxnID: {{log.attributes.paymentTxnId}} | Status: {{log.attributes.status}} | Method: {{log.attributes.paymentMethod}} | Amount: {{log.attributes.amount}} | Error: {{log.attributes.errMsg}}
+```
+
+Both changes are required. The `$VARIABLE` fix alone still fails because multi-line expansion breaks the double-serialized JSON.
+
+## Troubleshooting
+
+```bash
+# Check if mock server is running
+curl -s http://127.0.0.1:8899/health
+
+# Check port availability
+lsof -i :8899
+
+# Verbose curl output to see HTTP response details
+curl -v -X POST http://127.0.0.1:8899 \
+  -H "Content-Type: application/json" \
+  -d '{"input_data": "{\"request\":{\"subject\":\"test\"}}"}'
+```
+
+## Cleanup
+
+```bash
+# Stop mock server (Ctrl+C in Terminal 1)
+# No other resources to clean up — fully local reproduction
+```
+
+## References
+
+- [Datadog Webhooks Integration](https://docs.datadoghq.com/integrations/webhooks/)
+- [Datadog Webhook Variables](https://docs.datadoghq.com/integrations/webhooks/#variables)
+- [JSON String Escaping (RFC 8259)](https://datatracker.ietf.org/doc/html/rfc8259#section-7)
