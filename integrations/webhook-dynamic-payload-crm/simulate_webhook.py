@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Simulate Datadog webhook variable substitution to reproduce ZD-2497825.
-Demonstrates why dynamic payloads break the CRM endpoint.
+Simulate Datadog webhook variable substitution for double-serialized JSON payloads.
+Demonstrates why multi-line $TEXT_ONLY_MSG breaks CRM endpoints that parse input_data.
 """
 
 import json

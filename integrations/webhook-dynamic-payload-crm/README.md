@@ -1,11 +1,11 @@
-# Webhook Dynamic Payload - Double-Serialized JSON with Variable Substitution
+# Webhook - Double-Serialized JSON with $TEXT_ONLY_MSG
 
 ## Context
 
-Reproduces a failure when using Datadog webhook dynamic variables (`$EVENT_TITLE`, `$TEXT_ONLY_MSG`) inside a double-serialized JSON payload (where the `input_data` field value is itself a JSON-encoded string). Two compounding issues prevent the target API from accepting the request:
+Reproduces a failure when using Datadog webhook variables (`$EVENT_TITLE`, `$TEXT_ONLY_MSG`) inside a double-serialized JSON payload — when the target CRM API expects `input_data` to be a JSON-encoded string. Two compounding issues prevent the API from accepting the request:
 
-1. Using monitor template syntax (`{{EVENT_TITLE}}`) instead of webhook syntax (`$EVENT_TITLE`) — variables are sent as literal text
-2. Multi-line `$TEXT_ONLY_MSG` expansion inserts newline characters inside the JSON string, producing `Invalid control character` parse errors
+1. **Wrong syntax:** Using monitor template syntax (`{{EVENT_TITLE}}`) in the webhook payload instead of webhook syntax (`$EVENT_TITLE`) — variables are sent as literal text
+2. **Multi-line content:** When `$TEXT_ONLY_MSG` contains real newlines (e.g. from `{{log.message}}` with multiline logs), they are inserted raw into the JSON string, producing **Invalid control character** parse errors
 
 ## Environment
 
@@ -31,13 +31,25 @@ sequenceDiagram
     alt Static payload
         API-->>DD: 200 OK (case created)
     end
-    alt Multi-line $TEXT_ONLY_MSG
+    alt Multi-line $TEXT_ONLY_MSG (real newlines)
         API-->>DD: 400 Invalid control character
     end
-    alt Single-line $TEXT_ONLY_MSG
+    alt Single-line or escaped \n
         API-->>DD: 200 OK (case created)
     end
 ```
+
+## Log Message Formats and CRM Impact
+
+When the monitor uses `{{log.message}}` and the webhook puts `$TEXT_ONLY_MSG` in `input_data`, the log message format determines whether the CRM can parse the JSON:
+
+| Format | Log message content | CRM JSON parse | Notes |
+|--------|---------------------|----------------|-------|
+| **Multiline** | Real line breaks (U+000A) | Fails | Invalid control characters; CRM rejects |
+| **Singleline** | No newlines | OK | Valid JSON |
+| **Escaped \n** | Literal `\n` (backslash-n) | OK | Safe; no control chars |
+
+**Fix:** Avoid `{{log.message}}` when logs are multiline. Use attribute placeholders only (`{{log.attributes.applicationNumber}}`, etc.) and flatten the monitor message to one line.
 
 ## Quick Start
 
@@ -54,7 +66,7 @@ cd datadog-sandboxes-by-ai/integrations/webhook-dynamic-payload-crm
 python3 simulate_webhook.py
 ```
 
-Runs 4 test cases covering all payload variants and prints pass/fail for each.
+Runs test cases covering static vs dynamic payloads, `{{...}}` vs `$VARIABLE` syntax, and multi-line vs single-line `$TEXT_ONLY_MSG`.
 
 ### 3. Run end-to-end with mock CRM server
 
@@ -106,6 +118,13 @@ curl -s http://127.0.0.1:8899/health
 | `$EVENT_TITLE` + multi-line `$TEXT_ONLY_MSG` | 400 JSON parse error | 400 `Invalid control character at: line 1 column 174` |
 | `$EVENT_TITLE` + single-line `$TEXT_ONLY_MSG` | 200 OK, case created with dynamic data | 200 OK |
 
+### Custom Variable Limitation
+
+Webhook **custom variables** (Integrations > Webhooks > Custom Variables) store **static values** only. If you set `PAYLOAD_MSG` = `{{log.message}}` as a custom variable:
+
+- The webhook sends the literal string `"{{log.message}}"` — no monitor template expansion
+- **Fix:** Use the built-in `$TEXT_ONLY_MSG` in the webhook payload. Put `{{log.message}}` or `{{log.attributes.X}}` in the **monitor notification message**; Datadog renders it there, and the result becomes `$TEXT_ONLY_MSG`.
+
 ## Fix / Workaround
 
 Two changes required in the Datadog webhook configuration:
@@ -121,7 +140,7 @@ Two changes required in the Datadog webhook configuration:
 **Change 2 — Flatten the monitor notification message to a single line:**
 
 ```
-Alert: {{log.attributes.applicationNumber}} | TxnID: {{log.attributes.paymentTxnId}} | Status: {{log.attributes.status}} | Method: {{log.attributes.paymentMethod}} | Amount: {{log.attributes.amount}} | Error: {{log.attributes.errMsg}}
+Alert: {{log.attributes.applicationNumber}} | TxnID: {{log.attributes.paymentTxnId}} | Status: {{log.attributes.status}} | Method: {{log.attributes.paymentMethod}} | Amount: {{log.attributes.amount}} | Error: {{log.attributes.errMsg}} | Log: {{log.link}}
 ```
 
 Both changes are required. The `$VARIABLE` fix alone still fails because multi-line expansion breaks the double-serialized JSON.
