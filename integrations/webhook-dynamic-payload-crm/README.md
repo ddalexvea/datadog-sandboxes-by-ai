@@ -145,6 +145,88 @@ Alert: {{log.attributes.applicationNumber}} | TxnID: {{log.attributes.paymentTxn
 
 Both changes are required. The `$VARIABLE` fix alone still fails because multi-line expansion breaks the double-serialized JSON.
 
+## End-to-End API Test (Monitor + Webhook + Logs)
+
+Run a full flow using Datadog API: create webhook integration, create Log monitor, send log, verify webhook.site receives payload with resolved `$TEXT_ONLY_MSG`.
+
+### 1. Webhook.site setup
+
+1. Open [https://webhook.site](https://webhook.site)
+2. Copy your unique URL (e.g. `https://webhook.site/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`)
+
+### 2. Webhook integration (API)
+
+Create or update the webhook in Datadog:
+
+```bash
+# Create webhook (or update URL if name exists)
+curl -X POST "https://api.datadoghq.com/api/v1/integration/webhooks/configuration/webhooks" \
+  -H "Content-Type: application/json" \
+  -H "DD-API-KEY: $DD_API_KEY" \
+  -H "DD-APPLICATION-KEY: $DD_APP_KEY" \
+  -d '{"name":"webhook-sandbox-test","url":"https://webhook.site/YOUR-UUID"}'
+
+# Update webhook URL (if already exists)
+curl -X PUT "https://api.datadoghq.com/api/v1/integration/webhooks/configuration/webhooks/webhook-sandbox-test" \
+  -H "Content-Type: application/json" \
+  -H "DD-API-KEY: $DD_API_KEY" \
+  -H "DD-APPLICATION-KEY: $DD_APP_KEY" \
+  -d '{"url":"https://webhook.site/YOUR-UUID"}'
+```
+
+### 3. Log monitor (API)
+
+Create a Log monitor with `{{log.attributes.X}}` in the message and `@webhook-webhook-sandbox-test`:
+
+```bash
+curl -X POST "https://api.datadoghq.com/api/v1/monitor" \
+  -H "Content-Type: application/json" \
+  -H "DD-API-KEY: $DD_API_KEY" \
+  -H "DD-APPLICATION-KEY: $DD_APP_KEY" \
+  -d '{
+    "name": "[Webhook Sandbox] Log monitor - DELETE ME",
+    "type": "log alert",
+    "query": "logs(\"service:webhook-sandbox-test\").rollup(\"count\").last(\"5m\") > 0",
+    "message": "Application: {{log.attributes.applicationNumber}} | TxnID: {{log.attributes.paymentTxnId}} | Status: {{log.attributes.status}} | Amount: {{log.attributes.amount}} | Error: {{log.attributes.errMsg}} | Log: {{log.link}}\n\n@webhook-webhook-sandbox-test",
+    "options": {"thresholds": {"critical": 0}, "enable_logs_sample": true, "notify_no_data": false}
+  }'
+```
+
+### 4. Send log (API)
+
+```bash
+curl -X POST "https://http-intake.logs.datadoghq.com/v1/input" \
+  -H "Content-Type: application/json" \
+  -H "DD-API-KEY: $DD_API_KEY" \
+  -d '[{
+    "service": "webhook-sandbox-test",
+    "ddsource": "node",
+    "message": "Payment redirect: applicationNumber=APP-12345, paymentTxnId=TXN-67890, status=FAILED",
+    "applicationNumber": "APP-12345",
+    "paymentTxnId": "TXN-67890",
+    "status": "FAILED",
+    "amount": "5000.00",
+    "errMsg": "Card authentication failed"
+  }]'
+```
+
+### 5. Run full E2E script
+
+The `api_e2e_test.py` script automates all steps: create webhook, create monitor, send log, wait for evaluation, poll webhook.site, delete monitor.
+
+```bash
+export DD_API_KEY="your-api-key"
+export DD_APP_KEY="your-app-key"
+export WEBHOOK_URL="https://webhook.site/YOUR-UUID"
+python3 api_e2e_test.py
+```
+
+**Note:** For EU/US1-FED use `api.datadoghq.eu` or `api.us1.datadoghq.com`. Set `DD_SITE=eu1` or `DD_SITE=us1` if using the script.
+
+### 6. Verify webhook content
+
+Check [https://webhook.site/#!/view/YOUR-UUID](https://webhook.site) for incoming POST requests. The payload should contain `$TEXT_ONLY_MSG` with resolved attributes: `Application: APP-12345 | TxnID: TXN-67890 | ...`.
+
 ## Troubleshooting
 
 ```bash
