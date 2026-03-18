@@ -448,6 +448,130 @@ attention      | 2026-03-18 18:50:28.722
 attention      | 2026-03-18 18:45:58.708
 ```
 
+---
+
+### Additional edge-case diagnostic queries (NUMA, Azure SQL, etc.)
+
+**6. Engine edition and XE scope**
+
+Identifies Azure SQL vs standalone; determines which DMV to use (`dm_xe_sessions` for ON SERVER, `dm_xe_database_sessions` for Azure SQL ON DATABASE).
+
+```bash
+kubectl run sqlcmd-edition --rm -i --restart=Never --image=mcr.microsoft.com/mssql-tools:latest -- \
+  /opt/mssql-tools/bin/sqlcmd -S sqlserver -U sa -P YourStrong@Passw0rd -C -W -s"|" -Q "
+SELECT SERVERPROPERTY('EngineEdition') AS engine_edition,
+       SERVERPROPERTY('ProductVersion') AS product_version;
+"
+```
+
+Real output (minikube / Azure SQL Edge):
+
+```
+engine_edition | product_version
+---------------|-----------------
+2              | 16.0.1000.6
+```
+
+| engine_edition | Meaning | XE DMV |
+|----------------|---------|--------|
+| 1 | Personal/Desktop | `sys.dm_xe_sessions` |
+| 2 | Standard | `sys.dm_xe_sessions` |
+| 3 | Enterprise | `sys.dm_xe_sessions` |
+| 4 | Express | `sys.dm_xe_sessions` |
+| 5 | **Azure SQL Database** | `sys.dm_xe_database_sessions` |
+
+**7. NUMA node count**
+
+Multi-NUMA increases likelihood of `PER_NODE` creating multiple ring buffer partitions; with `fetchone()`, only the first is read.
+
+```bash
+kubectl run sqlcmd-numa-nodes --rm -i --restart=Never --image=mcr.microsoft.com/mssql-tools:latest -- \
+  /opt/mssql-tools/bin/sqlcmd -S sqlserver -U sa -P YourStrong@Passw0rd -C -W -s"|" -Q "
+SELECT node_id, memory_node_id, cpu_count, online_scheduler_count, active_worker_count
+FROM sys.dm_os_numa_nodes;
+"
+```
+
+Real output (minikube, single NUMA):
+
+```
+node_id | memory_node_id | cpu_count | online_scheduler_count | active_worker_count
+--------|----------------|-----------|------------------------|--------------------
+0       | 0              | 2         | 2                      | 2
+```
+
+Real output (Azure SQL DB, multi-NUMA – example):
+
+```
+node_id | memory_node_id | cpu_count | online_scheduler_count | active_worker_count
+--------|----------------|-----------|------------------------|--------------------
+0       | 0              | 4         | 4                      | 3
+1       | 1              | 4         | 4                      | 2
+2       | 2              | 4         | 4                      | 1
+3       | 3              | 4         | 4                      | 0
+```
+
+More than 1 row → multi-NUMA; with `MEMORY_PARTITION_MODE = PER_NODE`, expect multiple ring buffer partitions.
+
+**8. Ring buffer partition count (fetchone bug check)**
+
+Explicitly counts ring buffer rows per session. More than 1 row indicates the fetchone() bug.
+
+```bash
+kubectl run sqlcmd-partition-count --rm -i --restart=Never --image=mcr.microsoft.com/mssql-tools:latest -- \
+  /opt/mssql-tools/bin/sqlcmd -S sqlserver -U sa -P YourStrong@Passw0rd -C -W -s"|" -Q "
+SELECT s.name AS session_name, COUNT(*) AS ring_buffer_partition_count
+FROM sys.dm_xe_sessions s
+JOIN sys.dm_xe_session_targets t ON t.event_session_address = s.address
+WHERE s.name = 'datadog_query_errors' AND t.target_name = 'ring_buffer'
+GROUP BY s.name;
+"
+```
+
+Real output (minikube, 1 partition):
+
+```
+session_name         | ring_buffer_partition_count
+---------------------|----------------------------
+datadog_query_errors | 1
+```
+
+On Azure SQL DB with `PER_NODE`, you may see:
+
+```
+session_name         | ring_buffer_partition_count
+---------------------|----------------------------
+datadog_query_errors | 4
+```
+
+4 partitions → agent `fetchone()` reads only 1; events in the other 3 are skipped.
+
+**9. Azure SQL DB: use database-scoped DMVs**
+
+For engine_edition = 5, use `sys.dm_xe_database_sessions` and `sys.dm_xe_database_session_targets` instead of the server-scoped DMVs:
+
+```sql
+-- Azure SQL Database only
+SELECT t.target_name, t.execution_count,
+       LEN(CONVERT(NVARCHAR(MAX), t.target_data)) AS xml_bytes
+FROM sys.dm_xe_database_sessions s
+JOIN sys.dm_xe_database_session_targets t ON t.event_session_address = s.address
+WHERE s.name = 'datadog_query_errors';
+```
+
+Real output (Azure SQL DB, multi-NUMA):
+
+```
+target_name | execution_count | xml_bytes
+------------|-----------------|----------
+ring_buffer | 1               | 124000
+ring_buffer | 1               | 89200
+ring_buffer | 1               | 156000
+ring_buffer | 1               | 98000
+```
+
+Multiple `ring_buffer` rows → fetchone() bug confirmed.
+
 ### Screenshots
 
 Query Error panel (attention event captured):
