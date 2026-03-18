@@ -327,6 +327,127 @@ kubectl logs -n datadog -l app.kubernetes.io/name=datadog-agent -c agent --tail=
 | Agent `_process_events` | Non-zero length | Before workaround: 0; after: non-zero |
 | Query Error panel | Error message + attributes | "A cancel, client-interrupt request, time-out..." |
 
+### Check query and real output
+
+**1. Agent check**
+
+```bash
+kubectl exec -n datadog daemonset/datadog-agent -c agent -- agent check sqlserver
+```
+
+Real output (excerpt from sandbox run):
+
+```
+=== 1. SQL Server (master) ===
+  Instance ID: sqlserver:xxxxxxxx
+  Total rows: 142
+  ...
+==========
+Collector
+==========
+  Running Checks
+  --------------
+    sqlserver (22.10.1)
+    -------------
+      Total Runs: 1
+      ...
+      Instance sqlserver:xxxxxxxx - OK
+```
+
+**2. XE session events**
+
+```bash
+kubectl run sqlcmd-check --rm -i --restart=Never --image=mcr.microsoft.com/mssql-tools:latest -- \
+  /opt/mssql-tools/bin/sqlcmd -S sqlserver -U sa -P YourStrong@Passw0rd -C -W -s"|" -Q "
+SELECT es.name AS session_name, ese.name AS event_name
+FROM sys.server_event_sessions es
+JOIN sys.server_event_session_events ese ON es.event_session_id = ese.event_session_id
+WHERE es.name = 'datadog_query_errors';
+"
+```
+
+Real output:
+
+```
+session_name          | event_name
+----------------------|-----------------
+datadog_query_errors  | error_reported
+datadog_query_errors  | attention
+```
+
+**3. NUMA partition check (ring buffer)**
+
+```bash
+kubectl run sqlcmd-numa --rm -i --restart=Never --image=mcr.microsoft.com/mssql-tools:latest -- \
+  /opt/mssql-tools/bin/sqlcmd -S sqlserver -U sa -P YourStrong@Passw0rd -C -W -s"|" -Q "
+SELECT t.target_name, t.execution_count, LEN(CONVERT(NVARCHAR(MAX), t.target_data)) AS xml_bytes
+FROM sys.dm_xe_sessions s
+JOIN sys.dm_xe_session_targets t ON t.event_session_address = s.address
+WHERE s.name = 'datadog_query_errors';
+"
+```
+
+Real output (minikube, 1 NUMA node):
+
+```
+target_name | execution_count | xml_bytes
+------------|-----------------|----------
+ring_buffer | 1               | 3733
+```
+
+On Azure SQL DB multi-NUMA, you may see multiple `ring_buffer` rows; that confirms the fetchone() bug.
+
+**4. Agent logs (XE collection)**
+
+```bash
+kubectl logs -n datadog -l app.kubernetes.io/name=datadog-agent -c agent --tail=500 | \
+  grep -E "_query_ring_buffer|_process_events|datadog_query_errors|No events processed"
+```
+
+Real output before workaround (symptom):
+
+```
+[sqlserver._query_ring_buffer] received result length 3733
+[sqlserver._process_events] received result length 0
+No events processed from datadog_query_errors session
+```
+
+Real output after workaround (expected):
+
+```
+[sqlserver._query_ring_buffer] received result length 4122
+[sqlserver._process_events] received result length 3
+Found 3 events from datadog_query_errors session
+```
+
+**5. Ring buffer XML (view raw events on SQL Server)**
+
+```bash
+kubectl run sqlcmd-ring --rm -i --restart=Never --image=mcr.microsoft.com/mssql-tools:latest -- \
+  /opt/mssql-tools/bin/sqlcmd -S sqlserver -U sa -P YourStrong@Passw0rd -C -W -Q "
+SELECT xdr.value('@name', 'NVARCHAR(128)') AS event_name,
+       xdr.value('@timestamp', 'DATETIME') AS event_timestamp
+FROM (
+  SELECT CAST(t.target_data AS XML) AS Target_Data
+  FROM sys.dm_xe_sessions s
+  JOIN sys.dm_xe_session_targets t ON t.event_session_address = s.address
+  WHERE s.name = 'datadog_query_errors' AND t.target_name = 'ring_buffer'
+) AS src
+CROSS APPLY Target_Data.nodes('RingBufferTarget/event[@name=\"attention\" or @name=\"error_reported\"]') AS XEventData(xdr)
+ORDER BY event_timestamp DESC;
+"
+```
+
+Real output (after triggering attention):
+
+```
+event_name     | event_timestamp
+---------------|-------------------------
+attention      | 2026-03-18 18:50:43.707
+attention      | 2026-03-18 18:50:28.722
+attention      | 2026-03-18 18:45:58.708
+```
+
 ### Screenshots
 
 Query Error panel (attention event captured):
@@ -336,23 +457,6 @@ Query Error panel (attention event captured):
 Samples list (3 attention events, @sqlserver.xe_type:attention):
 
 ![Samples list - attention events](screenshot-samples-list.png)
-
-### Agent log examples
-
-Before workaround (symptom):
-
-```
-[sqlserver._query_ring_buffer] received result length 3733
-[sqlserver._process_events] received result length 0
-No events processed from datadog_query_errors session
-```
-
-After workaround (expected):
-
-```
-[sqlserver._query_ring_buffer] received result length XXXX
-[sqlserver._process_events] received result length N   (N > 0)
-```
 
 ## Fix / Workaround
 
