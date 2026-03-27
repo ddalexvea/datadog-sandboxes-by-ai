@@ -130,12 +130,13 @@ Wait ~10 seconds for the agents to start tailing, then inject lines with empties
 
 ```bash
 python3 -c "
+import os, random
 lines = []
 for i in range(1200):
     lines.append(f'log line {i}')
 for i in range(800):
     lines.append('')
-import random; random.shuffle(lines)
+random.shuffle(lines)
 with open(os.path.expanduser('~/dd-repro/logfiles/app.log'), 'a') as f:
     f.write('\n'.join(lines) + '\n')
 "
