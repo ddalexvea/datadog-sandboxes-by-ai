@@ -143,13 +143,43 @@ docker exec dd-agent-repro agent check sqlserver 2>&1 | grep "space_used" | wc -
 # Fix:  4 lines  (4 database files × 1 instance)
 ```
 
+## Root Cause (source code)
+
+`sqlserver.database.files.space_used` comes from **`sys.database_files`** (a per-database view), which is queried for each database in the instance's `self.databases` list. The controlling config key is `db_files_metrics`, which is **enabled by default (`True`) on every instance** — regardless of `database_autodiscovery` or `dbm` settings.
+
+```python
+# integrations-core/sqlserver/datadog_checks/sqlserver/config.py
+configurable_metrics = {
+    "db_files_metrics": {'enabled': True},  # ← DEFAULT ON for every instance
+    ...
+}
+```
+
+Both instances iterate all databases and submit `space_used` once per file → **2× total**.
+
 ## Fix
 
-Add `autodiscovery_exclude` to Instance B to prevent it from re-collecting the system databases that Instance A already covers. This preserves the two-instance load-splitting architecture.
+Disable `db_files_metrics` on **Instance A** (the DBM instance). This lets Instance B (with full `database_autodiscovery`) remain the single source for `space_used` across all discovered databases.
 
-**`conf.yaml`** — fixed: add 4 lines to Instance B
+**`conf.yaml`** — fixed: add `database_metrics` block to Instance A
 
 ```yaml
+init_config:
+
+instances:
+  - host: sqlserver-repro,1433
+    username: datadog
+    password: "DatadogPass123!"
+    connector: odbc
+    driver: ODBC Driver 18 for SQL Server
+    connection_string: "TrustServerCertificate=yes;Trusted_Connection=no;"
+    dbm: true
+    database_metrics:
+      db_files_metrics:
+        enabled: false       # ← add this block
+    tags:
+      - instance:A
+
   - host: sqlserver-repro,1433
     username: datadog
     password: "DatadogPass123!"
@@ -157,22 +187,20 @@ Add `autodiscovery_exclude` to Instance B to prevent it from re-collecting the s
     driver: ODBC Driver 18 for SQL Server
     connection_string: "TrustServerCertificate=yes;Trusted_Connection=no;"
     database_autodiscovery: true
-    autodiscovery_exclude:        # ← add these 4 lines
-      - master                    #
-      - msdb                      #
-      - tempdb                    #
-      - model                     #
     include_db_fragmentation_metrics: true
     include_task_scheduler_metrics: true
     tags:
       - instance:B
 ```
 
+> **Why not `autodiscovery_exclude`?** `autodiscovery_exclude` controls which databases get per-DB metrics like fragmentation and scheduler — it does NOT gate the `db_files_metrics` collection, which runs independently per instance. Excluding system databases still leaves all user databases in scope on Instance B, so both instances continue submitting `space_used` for all user DBs → still 2×.
+
 ### Verify the fix
 
 ```bash
 docker exec dd-agent-repro agent check sqlserver 2>&1 | grep "space_used" | wc -l
-# Now: 4 lines — each file submitted once, sum = real value
+# Bug:  8 lines  (4 files × 2 instances)
+# Fix:  4 lines  (4 files × 1 instance — only Instance B)
 ```
 
 ## Cleanup
