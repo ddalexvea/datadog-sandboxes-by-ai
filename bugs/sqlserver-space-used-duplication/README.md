@@ -1,215 +1,217 @@
-# sqlserver.database.files.space_used — 2× duplication with two check instances
+# sqlserver.database.files.space_used — duplication with two check instances
 
 ## Context
 
-When the SQL Server integration is configured with **two instances pointing at the same host** (a common pattern from older Datadog recommendations to split DBM vs autodiscovery load), every metric in the `sqlserver.database.files.*` namespace is submitted **twice per collection cycle**. Using `sum` aggregation in dashboards or monitors shows approximately **2× the real disk usage**, sometimes exceeding the actual disk size.
+When the SQL Server integration is configured with **two instances pointing at the same host** (a pattern from older Datadog recommendations to split DBM vs autodiscovery load), `sqlserver.database.files.space_used` is submitted by both instances. Using `sum` aggregation in dashboards or monitors shows inflated disk usage that can exceed the actual disk size.
 
-This sandbox reproduces the bug and validates the fix (`autodiscovery_exclude`).
+The metric comes from `sys.database_files` (per-database view) and is **enabled by default on every instance** via the `db_files_metrics` config key — regardless of whether `dbm` or `database_autodiscovery` is set.
 
 ## Environment
 
 - **Agent Version:** 7.x (latest)
-- **Platform:** Docker Compose (Azure SQL Edge)
-- **Integration:** SQL Server
+- **Platform:** Minikube + Helm
+- **Integration:** SQL Server (`connector: odbc`, `driver: ODBC Driver 18 for SQL Server`)
 
 ## Schema
 
 ```
-┌─────────────────────────────────────┐
-│         Datadog Agent               │
-│                                     │
-│  Instance A  (dbm: true)            │──► space_used submitted (x1)
-│  Instance B  (database_autodiscovery)│──► space_used submitted (x1)
-│                                     │
-│  Same host, same databases          │
-│  → 2 submissions per cycle          │
-└──────────────────┬──────────────────┘
-                   │ both point at
-                   ▼
-         SQL Server (port 1433)
+┌──────────────────────────────────────────────────────┐
+│                   Datadog Agent                      │
+│                                                      │
+│  Instance A (dbm: true)                              │
+│  → iterates DEFAULT database (master)                │──► space_used for master's files
+│  → db_files_metrics enabled by default              │
+│                                                      │
+│  Instance B (database_autodiscovery: true)           │
+│  → iterates ALL discovered databases                 │──► space_used for ALL databases' files
+│  → db_files_metrics enabled by default              │
+│                                                      │
+│  master's files submitted by BOTH → duplicated       │
+└────────────────────────┬─────────────────────────────┘
+                         │ both point at
+                         ▼
+               SQL Server (port 1433)
 ```
 
 ## Quick Start
 
-### 1. Start SQL Server + Agent (bug repro)
-
-Save the two config files below, then:
+### 1. Start SQL Server
 
 ```bash
-export DD_API_KEY=<your_api_key>
-docker compose up -d
-# Wait ~60s for SQL Server to initialise
-docker exec dd-agent-repro agent check sqlserver 2>&1 | grep -A2 "space_used"
+docker run -d --name sqlserver-repro \
+  -e ACCEPT_EULA=1 \
+  -e MSSQL_SA_PASSWORD="YourStrong@Passw0rd" \
+  -e MSSQL_PID=Developer \
+  -p 1433:1433 \
+  mcr.microsoft.com/azure-sql-edge:latest
+
+# Wait ~30s, then create the datadog login
+docker run --rm --network container:sqlserver-repro \
+  mcr.microsoft.com/mssql-tools:latest \
+  /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 'YourStrong@Passw0rd' -C -Q "
+  IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE name = 'datadog')
+    CREATE LOGIN datadog WITH PASSWORD = 'DatadogPass123!';
+  GRANT VIEW SERVER STATE TO datadog;
+  GRANT VIEW ANY DEFINITION TO datadog;
+  PRINT 'datadog login OK';"
 ```
 
-**`docker-compose.yml`**
+### 2. Deploy Datadog Agent (Minikube + Helm)
 
-```yaml
-services:
+```bash
+minikube start --memory=4096 --cpus=2
+kubectl create namespace datadog
+kubectl create secret generic datadog-secret -n datadog --from-literal=api-key=$DD_API_KEY
 
-  sqlserver:
-    image: mcr.microsoft.com/azure-sql-edge:latest
-    container_name: sqlserver-repro
-    environment:
-      ACCEPT_EULA: "1"
-      MSSQL_SA_PASSWORD: "YourStrong@Passw0rd"
-      MSSQL_PID: "Developer"
-    ports:
-      - "1433:1433"
-    volumes:
-      - sqlserver-data:/var/opt/mssql
-    healthcheck:
-      test: ["CMD-SHELL", "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 'YourStrong@Passw0rd' -C -Q 'SELECT 1' > /dev/null 2>&1 || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
-
-  sqlserver-init:
-    image: mcr.microsoft.com/mssql-tools:latest
-    container_name: sqlserver-init
-    depends_on:
-      sqlserver:
-        condition: service_healthy
-    command:
-      - /bin/bash
-      - -c
-      - |
-        /opt/mssql-tools/bin/sqlcmd -S sqlserver -U sa -P 'YourStrong@Passw0rd' -C -Q "
-        IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE name = 'datadog')
-          CREATE LOGIN datadog WITH PASSWORD = 'DatadogPass123!';
-        GRANT VIEW SERVER STATE TO datadog;
-        GRANT VIEW ANY DEFINITION TO datadog;
-        PRINT 'datadog login OK';
-        "
-    restart: "no"
-
-  dd-agent-repro:
-    image: gcr.io/datadoghq/agent:latest
-    container_name: dd-agent-repro
-    environment:
-      DD_API_KEY: "${DD_API_KEY}"
-      DD_SITE: "datadoghq.com"
-    volumes:
-      - ./conf.yaml:/etc/datadog-agent/conf.d/sqlserver.d/conf.yaml
-
-volumes:
-  sqlserver-data:
+helm repo add datadog https://helm.datadoghq.com && helm repo update
+helm install datadog-sql-repro datadog/datadog -n datadog -f values-bug.yaml
+kubectl rollout status daemonset/datadog-sql-repro -n datadog --timeout=120s
 ```
 
-**`conf.yaml`** — bug: two instances, same host
+**`values-bug.yaml`** — two instances, same host (replace `<MINIKUBE_GW>` with `minikube ssh "ip route | awk '/default/ {print \$3}'"`)
 
 ```yaml
-init_config:
+datadog:
+  apiKeyExistingSecret: datadog-secret
+  site: datadoghq.com
+  kubelet:
+    tlsVerify: false
+  confd:
+    sqlserver.yaml: |
+      init_config:
+      instances:
+        - host: <MINIKUBE_GW>,1433
+          username: datadog
+          password: "DatadogPass123!"
+          connector: odbc
+          driver: ODBC Driver 18 for SQL Server
+          connection_string: "TrustServerCertificate=yes;Trusted_Connection=no;"
+          dbm: true
+          tags:
+            - instance:dbm
+          min_collection_interval: 15
 
-instances:
-  - host: sqlserver-repro,1433
-    username: datadog
-    password: "DatadogPass123!"
-    connector: odbc
-    driver: ODBC Driver 18 for SQL Server
-    connection_string: "TrustServerCertificate=yes;Trusted_Connection=no;"
-    dbm: true
-    tags:
-      - instance:A
+        - host: <MINIKUBE_GW>,1433
+          username: datadog
+          password: "DatadogPass123!"
+          connector: odbc
+          driver: ODBC Driver 18 for SQL Server
+          connection_string: "TrustServerCertificate=yes;Trusted_Connection=no;"
+          database_autodiscovery: true
+          include_db_fragmentation_metrics: true
+          include_task_scheduler_metrics: true
+          tags:
+            - instance:autodiscovery
+          min_collection_interval: 15
 
-  - host: sqlserver-repro,1433
-    username: datadog
-    password: "DatadogPass123!"
-    connector: odbc
-    driver: ODBC Driver 18 for SQL Server
-    connection_string: "TrustServerCertificate=yes;Trusted_Connection=no;"
-    database_autodiscovery: true
-    include_db_fragmentation_metrics: true
-    include_task_scheduler_metrics: true
-    tags:
-      - instance:B
+clusterAgent:
+  enabled: false
+agents:
+  enabled: true
+```
+
+### 3. Run the check
+
+```bash
+AGENT_POD=$(kubectl get pod -n datadog -l app=datadog-sql-repro -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n datadog $AGENT_POD -c agent -- agent check sqlserver 2>&1 | grep "space_used" | wc -l
 ```
 
 ## Expected vs Actual
 
 | | Expected | Actual (bug) |
 |---|---|---|
-| `sqlserver.database.files.space_used` submissions per cycle | 1× per database file | **2×** per database file |
-| `sum` aggregation in Metrics Explorer | Real disk usage | **~2× real disk usage** |
-| `by {host}` aggregation | Correct per-host total | **2× per-host total** |
+| `space_used` submissions per cycle | 1× per database file | **>1×** for files covered by both instances |
+| `sum` aggregation in Metrics Explorer | Real disk usage | **inflated** |
+| `sum by {host}` | Correct per-host total | **inflated per-host total** |
 
-### Verify the duplication
+## Root Cause (confirmed from source code + live repro)
 
-```bash
-# Count how many space_used points are submitted in one check run
-docker exec dd-agent-repro agent check sqlserver 2>&1 | grep "space_used" | wc -l
-# Bug:  8 lines  (4 database files × 2 instances)
-# Fix:  4 lines  (4 database files × 1 instance)
-```
-
-## Root Cause (source code)
-
-`sqlserver.database.files.space_used` comes from **`sys.database_files`** (a per-database view), which is queried for each database in the instance's `self.databases` list. The controlling config key is `db_files_metrics`, which is **enabled by default (`True`) on every instance** — regardless of `database_autodiscovery` or `dbm` settings.
+`sqlserver.database.files.space_used` is collected by `SqlserverDatabaseFilesMetrics`, which queries `sys.database_files` for each database in the instance's `self.databases` list.
 
 ```python
 # integrations-core/sqlserver/datadog_checks/sqlserver/config.py
 configurable_metrics = {
-    "db_files_metrics": {'enabled': True},  # ← DEFAULT ON for every instance
+    "db_files_metrics": {'enabled': True},  # DEFAULT ON — every instance
     ...
 }
 ```
 
-Both instances iterate all databases and submit `space_used` once per file → **2× total**.
+**What each instance collects:**
+
+| Instance | `self.databases` scope | `space_used` submissions |
+|---|---|---|
+| Instance A (`dbm: true`, no `database_autodiscovery`) | DEFAULT database only (typically `master`) | Files belonging to `master` |
+| Instance B (`database_autodiscovery: true`) | All discovered databases | Files for every discovered database |
+
+**Result:** databases covered by Instance A (at minimum `master`) are also covered by Instance B → those files are submitted **twice**.
+
+### Actual repro output (live test, Azure SQL Edge)
+
+**Bug — 8 submissions:**
+```
+instance:dbm          | db:master  ← submitted by Instance A
+instance:dbm          | db:master  ← submitted by Instance A  (2 files in master)
+instance:autodiscovery | db:master  ← ALSO submitted by Instance B  ← duplication
+instance:autodiscovery | db:msdb
+instance:autodiscovery | db:msdb
+instance:autodiscovery | db:msdb
+instance:autodiscovery | db:msdb
+instance:autodiscovery | db:tempdb
+```
+
+`db:master` files appear **from both instances** → `sum by {host}` shows inflated value.
+
+**Fix — 6 submissions (Instance A contributes 0):**
+```
+instance:autodiscovery | db:master
+instance:autodiscovery | db:msdb   (×5)
+```
 
 ## Fix
 
-Disable `db_files_metrics` on **Instance A** (the DBM instance). This lets Instance B (with full `database_autodiscovery`) remain the single source for `space_used` across all discovered databases.
+Add `database_metrics.db_files_metrics.enabled: false` to **Instance A** (the DBM instance). This is a 3-line addition that preserves the two-instance load-splitting architecture entirely.
 
-**`conf.yaml`** — fixed: add `database_metrics` block to Instance A
+**`values-fix.yaml`** — same as `values-bug.yaml`, with one block added to Instance A:
 
 ```yaml
-init_config:
-
-instances:
-  - host: sqlserver-repro,1433
-    username: datadog
-    password: "DatadogPass123!"
-    connector: odbc
-    driver: ODBC Driver 18 for SQL Server
-    connection_string: "TrustServerCertificate=yes;Trusted_Connection=no;"
-    dbm: true
-    database_metrics:
-      db_files_metrics:
-        enabled: false       # ← add this block
-    tags:
-      - instance:A
-
-  - host: sqlserver-repro,1433
-    username: datadog
-    password: "DatadogPass123!"
-    connector: odbc
-    driver: ODBC Driver 18 for SQL Server
-    connection_string: "TrustServerCertificate=yes;Trusted_Connection=no;"
-    database_autodiscovery: true
-    include_db_fragmentation_metrics: true
-    include_task_scheduler_metrics: true
-    tags:
-      - instance:B
+        - host: <MINIKUBE_GW>,1433
+          username: datadog
+          password: "DatadogPass123!"
+          connector: odbc
+          driver: ODBC Driver 18 for SQL Server
+          connection_string: "TrustServerCertificate=yes;Trusted_Connection=no;"
+          dbm: true
+          database_metrics:         # ← add this block
+            db_files_metrics:       #
+              enabled: false        #
+          tags:
+            - instance:dbm
+          min_collection_interval: 15
 ```
-
-> **Why not `autodiscovery_exclude`?** `autodiscovery_exclude` controls which databases get per-DB metrics like fragmentation and scheduler — it does NOT gate the `db_files_metrics` collection, which runs independently per instance. Excluding system databases still leaves all user databases in scope on Instance B, so both instances continue submitting `space_used` for all user DBs → still 2×.
-
-### Verify the fix
 
 ```bash
-docker exec dd-agent-repro agent check sqlserver 2>&1 | grep "space_used" | wc -l
-# Bug:  8 lines  (4 files × 2 instances)
-# Fix:  4 lines  (4 files × 1 instance — only Instance B)
+helm upgrade datadog-sql-repro datadog/datadog -n datadog -f values-fix.yaml
+kubectl rollout status daemonset/datadog-sql-repro -n datadog --timeout=120s
+
+AGENT_POD=$(kubectl get pod -n datadog -l app=datadog-sql-repro -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n datadog $AGENT_POD -c agent -- agent check sqlserver 2>&1 | grep "space_used" | wc -l
+# Should be lower than bug count — Instance A no longer contributes any space_used
 ```
+
+> **Why not `autodiscovery_exclude`?**
+> `autodiscovery_exclude` controls which databases get per-DB metrics (fragmentation, scheduler). It does **not** gate `db_files_metrics`, which has its own `enabled` flag and runs per instance regardless of autodiscovery scope. In environments with user databases, excluding system databases from Instance B still leaves all user databases in scope → Instance B still submits `space_used` alongside Instance A → still inflated.
 
 ## Cleanup
 
 ```bash
-docker compose down -v
+helm uninstall datadog-sql-repro -n datadog
+kubectl delete namespace datadog
+docker rm -f sqlserver-repro
 ```
 
 ## References
 
+- [integrations-core: database_files_metrics.py](https://github.com/DataDog/integrations-core/blob/master/sqlserver/datadog_checks/sqlserver/database_metrics/database_files_metrics.py)
+- [integrations-core: config.py — db_files_metrics default](https://github.com/DataDog/integrations-core/blob/master/sqlserver/datadog_checks/sqlserver/config.py)
 - [SQL Server integration conf.yaml.example](https://github.com/DataDog/integrations-core/blob/master/sqlserver/datadog_checks/sqlserver/data/conf.yaml.example)
-- [autodiscovery_exclude parameter docs](https://docs.datadoghq.com/integrations/sqlserver/)
