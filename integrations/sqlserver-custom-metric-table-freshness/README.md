@@ -25,7 +25,7 @@ This sandbox verifies:
 graph LR
     A[Azure SQL Edge Container\nsqlserver-sandbox] -- port 1433 --> B[Datadog Agent Container\ndd-agent]
     B -- custom_queries --> A
-    B -- lnt.flightinfo.minutes_since_last_insert gauge --> C[Datadog Platform]
+    B -- myapp.job_tracking.minutes_since_last_insert gauge --> C[Datadog Platform]
 ```
 
 ## Quick Start
@@ -248,7 +248,7 @@ docker logs dd-agent 2>&1 | grep -i sqlserver
 docker exec dd-agent agent status | grep -A 20 sqlserver
 
 # Re-run check with full trace output
-docker exec dd-agent agent check sqlserver -l trace --table 2>&1 | grep -E "lnt|minutes_since|Series|Service|Error|WARN|Metric Sample"
+docker exec dd-agent agent check sqlserver -l trace --table 2>&1 | grep -E "minutes_since|Series|Service|Error|WARN|Metric Sample"
 
 # Test SQL Server connectivity from agent container
 docker exec dd-agent python3 -c "
