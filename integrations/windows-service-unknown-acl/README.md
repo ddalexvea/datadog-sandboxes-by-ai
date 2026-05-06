@@ -258,6 +258,49 @@ else:
 "
 ```
 
+## Reproduction Evidence
+
+Reproduced on **2026-05-06** — Windows Server 2022, Datadog Agent 7-latest, `EC2AMAZ-9T1HAPV`.
+
+**Instance:** `i-0a84137d6bd144a73` (us-east-1, t3.medium)
+**Agent account:** `NT AUTHORITY\SYSTEM` (default install)
+**Service under test:** `WSearch` (proxy for NTDS — same mechanism)
+
+### Baseline (ACL intact) — `status: 2` CRITICAL
+
+```json
+{
+  "check": "windows_service.state",
+  "host_name": "EC2AMAZ-9T1HAPV",
+  "status": 2,
+  "tags": ["windows_service:WSearch", "windows_service_state:stopped"]
+}
+```
+
+### After stripping `LC` with `sc sdset D:(D;;LC;;;SY)(A;;CCLC...)` — `status: 3` UNKNOWN
+
+```json
+{
+  "metric": "windows_service.state",
+  "points": [[1778093908, 1]],
+  "tags": ["windows_service:WSearch", "windows_service_state:unknown"],
+  "host": "EC2AMAZ-9T1HAPV"
+}
+```
+
+```json
+{
+  "check": "windows_service.state",
+  "host_name": "EC2AMAZ-9T1HAPV",
+  "timestamp": 1778093908,
+  "status": 3,
+  "message": "",
+  "tags": ["windows_service:WSearch", "windows_service_state:unknown"]
+}
+```
+
+UNKNOWN produced on demand by a single `sc sdset` call. Restored original SDDL → status reverted to `2` (CRITICAL/stopped).
+
 ## Expected vs Actual
 
 | Behavior | Before fix (restricted SDDL) | After fix (restored SDDL) |
