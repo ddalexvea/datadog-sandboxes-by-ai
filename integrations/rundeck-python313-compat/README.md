@@ -179,7 +179,8 @@ echo "Done. Restart the agent: sudo systemctl restart datadog-agent"
 echo "Then verify: datadog-agent check rundeck"
 echo "Remember: unsupported. Upgrade to Agent 7.72+ when possible."
 
-rm -rf "$WORK"
+# Cleanup only if WORK is a mktemp path under /tmp to avoid accidental deletion
+case "$WORK" in /tmp/tmp.*) rm -rf "$WORK" ;; *) echo "Skipping cleanup: unexpected path $WORK" ;; esac
 ```
 
 ## Root Cause
