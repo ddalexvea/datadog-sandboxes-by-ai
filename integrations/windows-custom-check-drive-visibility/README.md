@@ -21,16 +21,16 @@ The root cause is **Windows session-scoped drive mappings**. When a drive letter
 
 ## Schema
 
-```
+```mermaid
 flowchart TD
-    A["Interactive user session\nnet use L: \\fileserver\share"] --> B["L: visible in user session"]
-    B --> C["agent.exe check (manual, as user) → metric = 1"]
+    A["Interactive user session<br/>net use L: \\\\fileserver\\share"] --> B["L: visible in user session"]
+    B --> C["agent.exe check (manual, as user) → metric = 1 ✅"]
 
-    D["ddagentuser service session\n(no net use ran here)"] --> E["L: does NOT exist"]
-    E --> F["Agent service → os.path.exists('L:\\') = False → metric = 0"]
+    D["ddagentuser service session<br/>(no net use ran here)"] --> E["L: does NOT exist in service session"]
+    E --> F["Agent service → os.path.exists('L:\\') = False → metric = 0 ❌"]
 
-    G["Fix: create_mounts in disk.d/conf.yaml"] --> H["Agent mounts S: at service startup"]
-    H --> I["os.path.exists('S:\\LocationSubs') = True → metric = 1"]
+    G["Fix: create_mounts in disk.d/conf.yaml"] --> H["Agent mounts S: at service startup<br/>ddagentuser owns the mount"]
+    H --> I["os.path.exists('S:\\LocationSubs') = True → metric = 1 ✅"]
 ```
 
 ## Custom Check Code (exact reproduction)
