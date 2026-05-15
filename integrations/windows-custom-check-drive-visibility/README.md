@@ -21,20 +21,48 @@ The root cause is **Windows session-scoped drive mappings**. When a drive letter
 
 ## Schema
 
+### The problem — session isolation
+
 ```mermaid
-flowchart TD
-    A[Interactive user session] -->|net use L: fileserver-share| B[L drive visible in session]
-    B --> C[agent.exe check as user - metric = 1]
+flowchart LR
+    FS[SMB File Server]
 
-    D[ddagentuser service session] -->|no net use ran here| E[L drive does NOT exist]
-    E --> F[Agent service - os.path.exists returns False - metric = 0]
+    subgraph user_session [Interactive user session - vhap4128]
+        U[net use L: fileserver-share] --> L[L: mapped]
+        L --> CHK[agent.exe check - runs as vhap4128\nos.path.exists = True\nmetric = 1]
+    end
 
-    G[Fix: create_mounts in disk.d conf.yaml] --> H[Agent mounts S at service startup]
-    H --> I[os.path.exists S-LocationSubs = True - metric = 1]
+    subgraph svc_session [ddagentuser service session]
+        DD[Datadog Agent service] --> NO[L: not mapped here\nos.path.exists = False\nmetric = 0]
+    end
 
-    style C fill:#d4edda,color:#000
-    style F fill:#f8d7da,color:#000
-    style I fill:#d4edda,color:#000
+    FS --> user_session
+    FS -.->|share exists but session never mapped it| svc_session
+
+    style CHK fill:#d4edda,color:#000
+    style NO fill:#f8d7da,color:#000
+```
+
+### The fix — disk integration mounts the share for the Agent
+
+```mermaid
+flowchart LR
+    FS[SMB File Server]
+
+    subgraph disk_int [Disk integration - create_mounts]
+        DM[disk.d/conf.yaml\ncreate_mounts: S:\nhost + share + credentials]
+    end
+
+    subgraph svc_session [ddagentuser service session]
+        S[S: mounted by Agent at startup] --> CC[Custom check\npath: S:\\LocationSubs\nos.path.exists = True\nmetric = 1]
+        S --> DK[system.disk.total\ndevice_name:s:\nfree space metrics]
+    end
+
+    FS -->|Agent authenticates and mounts| disk_int
+    disk_int --> svc_session
+
+    style CC fill:#d4edda,color:#000
+    style DK fill:#d4edda,color:#000
 ```
 
 ## Custom Check Code (exact reproduction)
