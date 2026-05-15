@@ -330,7 +330,37 @@ device_name:s:
 "message": "L drive path is accessible: S:\LocationSubs"
 ```
 
-### Option 2 — UNC path directly in conf.yaml
+### Option 2 — Real local path (if L: is a `subst` drive) ✅ confirmed
+
+If `subst` returns an entry for `L:` (e.g. `L:\: => C:\SomeRealPath`), the drive letter is a virtual alias for a local directory. Just point the custom check directly at the real path — no share, no credentials, no disk integration needed.
+
+```powershell
+# Run on the target server to find the real path
+subst
+# Example output: L:\: => C:\SomeRealPath
+```
+
+Update `conf.yaml`:
+
+```yaml
+init_config:
+instances:
+  - path: "C:\\SomeRealPath\\LocationSubs"
+    tags:
+      - server:AGENTHOST
+      - check:location_subs
+```
+
+Restart Agent and verify:
+
+```powershell
+Restart-Service datadogagent -Force
+Start-Sleep 15
+& "C:\Program Files\Datadog\Datadog Agent\bin\agent.exe" check location_subs_check
+# Expected: message: "L drive path is accessible: C:\SomeRealPath\LocationSubs"
+```
+
+### Option 3 — UNC path directly in conf.yaml
 
 If the share is SMB and `ddagentuser` can be granted access (e.g., by creating a matching account on the file server or via domain credentials):
 
