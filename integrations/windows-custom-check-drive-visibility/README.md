@@ -27,9 +27,9 @@ The root cause is **Windows session-scoped drive mappings**. When a drive letter
 flowchart LR
     FS[SMB File Server]
 
-    subgraph user_session [Interactive user session - vhap4128]
+    subgraph user_session [Interactive user session - rdpuser]
         U[net use L: fileserver-share] --> L[L: mapped]
-        L --> CHK[agent.exe check - runs as vhap4128\nos.path.exists = True\nmetric = 1]
+        L --> CHK[agent.exe check - runs as rdpuser\nos.path.exists = True\nmetric = 1]
     end
 
     subgraph svc_session [ddagentuser service session]
