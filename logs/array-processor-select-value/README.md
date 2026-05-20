@@ -34,6 +34,8 @@ export DD_APP_KEY="<your-app-key>"
 
 ### 2. Create the pipeline
 
+You can import `pipeline.yaml` directly from the Datadog UI (**Logs → Pipelines → New Pipeline → Import**), or create it via API:
+
 ```bash
 curl -X POST "https://api.datadoghq.com/api/v1/logs/config/pipelines" \
   -H "DD-API-KEY: ${DD_API_KEY}" \
@@ -73,6 +75,16 @@ curl -X POST "https://api.datadoghq.com/api/v1/logs/config/pipelines" \
 ```
 
 Save the `id` from the response — you will need it for cleanup.
+
+### Pipeline configuration (UI)
+
+**Processor 1 — extract request:**
+
+![Array Processor config - request](pipeline-config-request.png)
+
+**Processor 2 — extract response:**
+
+![Array Processor config - response](pipeline-config-response.png)
 
 ### 3. Send a test log
 
@@ -141,28 +153,31 @@ for log in d.get('data', []):
 
 ## Expected Results
 
-### Before pipeline (no extracted attributes)
+### Before pipeline
 
-The log arrives with the raw `providers` array but no flat attributes.
+Without the pipeline, the log arrives with only the raw `providers` array — no flat attributes extracted:
 
-![Log before pipeline - no extracted attributes](before-pipeline.png)
+```json
+{
+  "providers": [
+    { "name": "provider-a", "request_body": "...", "response_body": "..." },
+    { "name": "provider-b", "response_body": "BLOB Data" },
+    { "name": "target-provider", "request_body": "...", "response_body": "..." },
+    { "name": "provider-c", "request_body": "..." }
+  ]
+}
+```
 
-### After pipeline (attributes extracted)
+### After pipeline
 
-The Array Processor traverses the array, finds the element where `name == "target-provider"`, and writes the specified fields to flat attributes:
+The Array Processor traverses the array, finds the element where `name == "target-provider"`, and writes the specified fields to flat attributes. `provider-a`, `provider-b`, and `provider-c` are untouched.
+
+![Log after pipeline - matched_request and matched_response extracted](after-pipeline.png)
 
 | Attribute | Value |
 |-----------|-------|
 | `@matched_request` | `{"query":"status","id":"42"}` |
 | `@matched_response` | `{"status":"ok","result":"found"}` |
-
-`provider-a`, `provider-b`, and `provider-c` are untouched.
-
-![Log after pipeline - matched_request and matched_response extracted](after-pipeline.png)
-
-### Pipeline configuration (UI)
-
-![Array Processor configuration in the Datadog pipeline UI](pipeline-config.png)
 
 ### Query examples
 
