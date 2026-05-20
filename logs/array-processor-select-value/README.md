@@ -157,16 +157,7 @@ for log in d.get('data', []):
 
 Without the pipeline, the log arrives with only the raw `providers` array — no flat attributes extracted:
 
-```json
-{
-  "providers": [
-    { "name": "provider-a", "request_body": "...", "response_body": "..." },
-    { "name": "provider-b", "response_body": "BLOB Data" },
-    { "name": "target-provider", "request_body": "...", "response_body": "..." },
-    { "name": "provider-c", "request_body": "..." }
-  ]
-}
-```
+![Log before pipeline - raw providers array, no extracted attributes](before-pipeline.png)
 
 ### After pipeline
 
