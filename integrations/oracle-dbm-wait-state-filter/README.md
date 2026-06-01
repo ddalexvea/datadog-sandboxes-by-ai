@@ -14,17 +14,23 @@ The workaround is a `custom_queries` block that reads `V$SESSION` with a `state 
 
 | Metric | Filter | What it counts |
 |--------|--------|----------------|
-| `oracle.all_sessions.count` | None | All user sessions with `sql_exec_start > threshold` |
+| `oracle.all_sessions.count` | None | All user sessions running > threshold |
 | `oracle.active_sessions.count` | `state != 'WAITING'` | Only sessions not blocked in a wait state |
 
-**Validated results (two scenarios):**
+**Three sessions, three behaviors:**
 
-| Scenario | `oracle.all_sessions.count` | `oracle.active_sessions.count` |
-|----------|-----------------------------|-------------------------------|
-| 1 blocked waiter (>60s), 0 active | 2 | 0 |
-| 1 blocked waiter + 1 active CPU query (>60s) | 3 | 1 |
+| Session | What it does | V$SESSION state | wait_class | Counted in all? | Counted in active? |
+|---------|-------------|-----------------|------------|-----------------|-------------------|
+| A — lock holder | `UPDATE` + `DBMS_LOCK.SLEEP(300)` | `WAITING` | `Idle` | No (Idle filtered) | No |
+| B — blocked waiter | `UPDATE` same row → blocks | `WAITING` | `Application` | **Yes** | **No** |
+| C — active CPU | `SELECT SUM(slow_hash(id))` ~143s | `WAITED SHORT TIME` | `Other` | **Yes** | **Yes** |
 
-Scenario B is the key proof: the filter correctly isolates the 1 actively executing session from the blocked ones.
+**Confirmed result (agent check oracle):**
+
+```
+oracle.all_sessions.count    = 3   ← Sessions B + C accumulate wall-clock duration
+oracle.active_sessions.count = 1   ← Only Session C passes the state != 'WAITING' filter
+```
 
 ## Environment
 
@@ -39,22 +45,24 @@ Scenario B is the key proof: the filter correctly isolates the 1 actively execut
 graph LR
   subgraph oracle-sandbox
     B[Oracle Free 23c\nFREEPDB1]
-    SA[Session A\nlock holder\nDBMS_LOCK.SLEEP 300s]
-    SB[Session B\nblocked UPDATE\nenq: TX contention]
-    SA -->|holds row lock| B
-    SB -->|blocked waiting| B
+    SA["Session A\nlock holder\nUPDATE + DBMS_LOCK.SLEEP(300)\nstate=WAITING wait_class=Idle"]
+    SB["Session B\nblocked waiter\nUPDATE lock_test\nstate=WAITING wait_class=Application"]
+    SC["Session C\nactive CPU query\nSELECT SUM(slow_hash) 150K rows\nstate=WAITED SHORT TIME wait_class=Other"]
+    SA -->|holds row lock, Idle wait| B
+    SB -->|blocked on enq: TX| B
+    SC -->|actively executing| B
   end
 
   subgraph datadog
     A[Datadog Agent\nAutodiscovery]
   end
 
-  B -->|V$SESSION\nsql_exec_start / state / wait_class| A
+  B -->|V$SESSION\nstate / wait_class / sql_exec_start| A
 
-  A -->|all_sessions query\nno state filter\ncount=2| D[oracle.all_sessions.count]
-  A -->|active_sessions query\nstate != WAITING\ncount=0| E[oracle.active_sessions.count]
+  A -->|"all_sessions query\nno state filter → 3"| D["oracle.all_sessions.count = 3"]
+  A -->|"active_sessions query\nstate != WAITING → 1"| E["oracle.active_sessions.count = 1"]
 
-  D -->|"delta proves filter works\nall=2 vs active=0"| F[Datadog Org\nMetrics Explorer]
+  D --> F[Datadog Org]
   E --> F
 ```
 
@@ -102,17 +110,17 @@ spec:
                 "password": "testpass",
                 "service_name": "FREEPDB1",
                 "dbm": true,
-                "query_activity": {"enabled": true},
+                "query_activity": {"enabled": false},
                 "custom_queries": [
                   {
                     "metric_prefix": "oracle.active_sessions",
-                    "query": "SELECT COUNT(*) as active_long_running FROM V$SESSION WHERE username IS NOT NULL AND type = 'USER' AND state != 'WAITING' AND wait_class NOT IN ('Idle', 'Lock', 'User I/O') AND sql_exec_start IS NOT NULL AND (SYSDATE - sql_exec_start) * 86400 > 60",
+                    "query": "SELECT COUNT(*) as count FROM V$SESSION WHERE username IS NOT NULL AND type = 'USER' AND state != 'WAITING' AND wait_class NOT IN ('Idle', 'Application', 'Concurrency', 'User I/O') AND sql_exec_start IS NOT NULL AND (SYSDATE - sql_exec_start) * 86400 > 60",
                     "columns": [{"name": "count", "type": "gauge"}],
                     "tags": ["filter:active_only"]
                   },
                   {
                     "metric_prefix": "oracle.all_sessions",
-                    "query": "SELECT COUNT(*) as all_long_running FROM V$SESSION WHERE username IS NOT NULL AND type = 'USER' AND sql_exec_start IS NOT NULL AND (SYSDATE - sql_exec_start) * 86400 > 60",
+                    "query": "SELECT COUNT(*) as count FROM V$SESSION WHERE username IS NOT NULL AND type = 'USER' AND sql_exec_start IS NOT NULL AND (SYSDATE - sql_exec_start) * 86400 > 60 AND wait_class != 'Idle'",
                     "columns": [{"name": "count", "type": "gauge"}],
                     "tags": ["filter:none"]
                   }
@@ -161,7 +169,7 @@ spec:
 MANIFEST
 ```
 
-Wait for Oracle to be ready (~2-3 min):
+Wait for Oracle (~2-3 min):
 
 ```bash
 kubectl wait --for=condition=ready pod -l app=oracle -n oracle-sandbox --timeout=300s
@@ -181,132 +189,136 @@ helm upgrade --install datadog-agent datadog/datadog -n datadog \
   --set agents.image.tag=7
 ```
 
-### 4. Create the lock test table
+### 4. Create test data
 
 ```bash
 ORACLE_POD=$(kubectl get pod -n oracle-sandbox -l app=oracle -o jsonpath='{.items[0].metadata.name}')
 
 kubectl exec -n oracle-sandbox $ORACLE_POD -- bash -c "sqlplus -s system/testpass@//localhost:1521/FREEPDB1 <<'EOSQL'
+-- Lock test table for Sessions A and B
 CREATE TABLE lock_test (id NUMBER PRIMARY KEY, val NUMBER);
 INSERT INTO lock_test VALUES (1, 0);
 COMMIT;
-SELECT 'Table ready' AS status FROM DUAL;
+
+-- Slow hash function: 5000 iterations per row, ~9.5s per 10K rows
+-- Used by Session C to simulate a single long-running SQL statement (>60s)
+CREATE OR REPLACE FUNCTION slow_hash(n NUMBER) RETURN NUMBER IS
+  v NUMBER := n;
+BEGIN
+  FOR i IN 1..5000 LOOP
+    v := MOD(v * 1103515245 + 12345, 2147483648);
+  END LOOP;
+  RETURN v;
+END;
+/
+
+-- 150K-row table: slow_hash on all rows takes ~143s as a single SQL statement
+CREATE TABLE big_table AS
+SELECT ROWNUM AS id, DBMS_RANDOM.VALUE AS val
+FROM dual CONNECT BY ROWNUM <= 50000;
+
+INSERT INTO big_table SELECT ROWNUM + 50000,  DBMS_RANDOM.VALUE FROM dual CONNECT BY ROWNUM <= 50000;
+INSERT INTO big_table SELECT ROWNUM + 100000, DBMS_RANDOM.VALUE FROM dual CONNECT BY ROWNUM <= 50000;
+COMMIT;
+
+SELECT 'Tables and function ready. Rows: ' || COUNT(*) AS status FROM big_table;
 EOSQL"
 ```
 
-### 5. Simulate sessions
+### 5. Launch the three sessions
 
-**Session A — CPU-intensive (actively executing):**
+> Start all three within a few seconds of each other.
+
+**Session A — lock holder (holds row lock, appears as Idle wait):**
 
 ```bash
 ORACLE_POD=$(kubectl get pod -n oracle-sandbox -l app=oracle -o jsonpath='{.items[0].metadata.name}')
 
 kubectl exec -n oracle-sandbox $ORACLE_POD -- bash -c "
 nohup sqlplus -s system/testpass@//localhost:1521/FREEPDB1 <<'EOSQL' > /tmp/session_a.log 2>&1 &
-DECLARE v_count NUMBER := 0;
 BEGIN
-  LOOP
-    SELECT COUNT(*) INTO v_count FROM all_objects, all_objects WHERE ROWNUM <= 50000;
-    v_count := v_count + 1;
-  END LOOP;
+  UPDATE lock_test SET val = val + 1 WHERE id = 1;
+  SYS.DBMS_LOCK.SLEEP(300);
+  COMMIT;
 END;
 /
 EOSQL
-echo 'Session A started (CPU loop)'"
+echo 'Session A started (lock holder, 300s)'"
 ```
 
-**Session B — blocked on row lock (wait state):**
+**Session B — blocked waiter (accumulates wall-clock duration, wait_class=Application):**
 
 ```bash
 kubectl exec -n oracle-sandbox $ORACLE_POD -- bash -c "
 nohup sqlplus -s system/testpass@//localhost:1521/FREEPDB1 <<'EOSQL' > /tmp/session_b.log 2>&1 &
 UPDATE lock_test SET val = 99 WHERE id = 1;
 EOSQL
-echo 'Session B started (blocked on lock)'"
+echo 'Session B started (blocked on Session A lock)'"
 ```
+
+**Session C — actively executing CPU query (~143s single SQL statement):**
+
+```bash
+kubectl exec -n oracle-sandbox $ORACLE_POD -- bash -c "
+nohup sqlplus -s system/testpass@//localhost:1521/FREEPDB1 <<'EOSQL' > /tmp/session_c.log 2>&1 &
+SELECT SUM(slow_hash(id)) FROM big_table WHERE ROWNUM <= 150000;
+EOSQL
+echo 'Session C started (active slow_hash query, ~143s)'"
+```
+
+> Wait **65 seconds** for all sessions to cross the `> 60s` threshold before running test commands.
 
 ## Test Commands
 
-### Verify session states in V$SESSION
+### 1. Verify session states in V$SESSION (direct Oracle)
 
 ```bash
 ORACLE_POD=$(kubectl get pod -n oracle-sandbox -l app=oracle -o jsonpath='{.items[0].metadata.name}')
 
 kubectl exec -n oracle-sandbox $ORACLE_POD -- bash -c "sqlplus -s system/testpass@//localhost:1521/FREEPDB1 <<'EOSQL'
-SET LINESIZE 200
+SET LINESIZE 220
 COLUMN username   FORMAT A10
 COLUMN state      FORMAT A22
 COLUMN wait_class FORMAT A16
-COLUMN event      FORMAT A32
+COLUMN sql_text   FORMAT A48
 
-SELECT s.sid, s.username, s.state, s.wait_class, s.event,
-  ROUND((SYSDATE - s.sql_exec_start)*86400) AS dur_sec
+SELECT s.sid, s.username, s.state, s.wait_class,
+  ROUND((SYSDATE - s.sql_exec_start)*86400) AS dur_sec,
+  SUBSTR(q.sql_text,1,48) AS sql_text
 FROM v\$session s
+LEFT JOIN v\$sql q ON s.sql_id = q.sql_id
 WHERE s.username IS NOT NULL AND s.type = 'USER'
   AND s.wait_class != 'Idle'
 ORDER BY dur_sec DESC NULLS LAST;
 EOSQL"
 ```
 
-Expected: Session B shows `state = WAITING`, `wait_class = Application`, `event = enq: TX - row lock contention`.
-
-### Run the before/after filter queries
+### 2. Before/after filter counts (direct Oracle)
 
 ```bash
+# WITHOUT filter — counts all long-running sessions regardless of wait state
 kubectl exec -n oracle-sandbox $ORACLE_POD -- bash -c "sqlplus -s system/testpass@//localhost:1521/FREEPDB1 <<'EOSQL'
--- WITHOUT filter
-SELECT 'All long-running (no filter)' AS label, COUNT(*) AS cnt
+SELECT COUNT(*) AS all_sessions_count
 FROM V\$SESSION
 WHERE username IS NOT NULL AND type = 'USER'
   AND sql_exec_start IS NOT NULL
-  AND (SYSDATE - sql_exec_start)*86400 > 10
+  AND (SYSDATE - sql_exec_start)*86400 > 60
   AND wait_class != 'Idle';
 EOSQL"
 
+# WITH filter — only sessions not in a wait state
 kubectl exec -n oracle-sandbox $ORACLE_POD -- bash -c "sqlplus -s system/testpass@//localhost:1521/FREEPDB1 <<'EOSQL'
--- WITH filter
-SELECT 'Active only (state != WAITING)' AS label, COUNT(*) AS cnt
+SELECT COUNT(*) AS active_sessions_count
 FROM V\$SESSION
 WHERE username IS NOT NULL AND type = 'USER'
   AND sql_exec_start IS NOT NULL
-  AND (SYSDATE - sql_exec_start)*86400 > 10
+  AND (SYSDATE - sql_exec_start)*86400 > 60
+  AND wait_class != 'Idle'
   AND state != 'WAITING';
 EOSQL"
 ```
 
-### Run the agent check
-
-```bash
-AGENT_POD=$(kubectl get pod -n datadog -l app=datadog-agent -o jsonpath='{.items[0].metadata.name}')
-kubectl exec -n datadog $AGENT_POD -c agent -- agent check oracle 2>&1 | grep -B1 -A8 "active_sessions\|all_sessions"
-```
-
-## Expected Outputs
-
-### V$SESSION after 60s (direct Oracle query)
-
-```
-       SID USERNAME   STATE                WAIT_CLASS       DUR_SEC
----------- ---------- -------------------- ---------------- ----------
-       223 SYSTEM     WAITING              Application           79
-```
-
-Session B (blocked UPDATE) shows `state = WAITING`, `wait_class = Application`, duration accumulating.
-Session A (lock holder sleeping) shows `wait_class = Idle` — filtered out by `wait_class != 'Idle'` in both queries.
-
-### Before/after filter queries (direct sqlplus)
-
-```
-LABEL                                              CNT
--------------------------------------------------- ----
-All long-running (no filter)                          1
-
-LABEL                                              CNT
--------------------------------------------------- ----
-Active only (state != WAITING)                        0
-```
-
-### agent check oracle output
+### 3. agent check oracle (via Datadog Agent)
 
 ```bash
 AGENT_POD=$(kubectl get pod -n datadog -l app=datadog-agent -o jsonpath='{.items[0].metadata.name}')
@@ -314,38 +326,11 @@ kubectl exec -n datadog $AGENT_POD -c agent -- agent check oracle 2>&1 \
   | grep -B1 -A5 "active_sessions.count\|all_sessions.count"
 ```
 
-**Scenario A — only blocked sessions (>60s), no active:**
-
-```json
-{ "metric": "oracle.all_sessions.count",    "points": [[..., 2]] },
-{ "metric": "oracle.active_sessions.count", "points": [[..., 0]] }
-```
-
-**Scenario B — 1 blocked + 1 actively executing (>60s) — the key proof:**
-
-```json
-{ "metric": "oracle.all_sessions.count",    "points": [[..., 3]] },
-{ "metric": "oracle.active_sessions.count", "points": [[..., 1]] }
-```
-
-Reproduce Scenario B by starting Session C (`slow_hash` on 150K rows, ~143s) alongside Sessions A and B. After 65s the check returns `all=3, active=1`.
-
-**V$SESSION at that moment:**
-
-```
-SID  USERNAME  STATE                WAIT_CLASS   DUR_SEC  SQL_TEXT
-223  SYSTEM    WAITING              Application      182  UPDATE lock_test SET val = 99 WHERE id = 1
- 53  SYSTEM    WAITED SHORT TIME    Other             83  SELECT SUM(slow_hash(id)) FROM big_table...
-```
-
-- SID 223 `WAITING` → **excluded** from `active_sessions.count`
-- SID 53 `WAITED SHORT TIME` → **included** in `active_sessions.count`
-
-### Datadog API query (last 10 min)
+### 4. Datadog API query (verify data reached your org)
 
 ```bash
-API_KEY=$(kubectl get secret datadog-keys -n default -o jsonpath='{.data.api-key}' | base64 -d)
-APP_KEY=$(kubectl get secret datadog-keys -n default -o jsonpath='{.data.app-key}' | base64 -d)
+API_KEY=<your-api-key>
+APP_KEY=<your-app-key>
 FROM=$(($(date +%s) - 600))
 
 curl -s -G "https://api.datadoghq.com/api/v1/query" \
@@ -355,37 +340,63 @@ curl -s -G "https://api.datadoghq.com/api/v1/query" \
   --data-urlencode "query=oracle.all_sessions.count{*},oracle.active_sessions.count{*}"
 ```
 
-Expected response (after ~2 min ingestion lag):
+> Run `agent check oracle` first — it shows correct values immediately. The API reflects data ~1-2 min after submission.
+
+## Expected Outputs
+
+### V$SESSION (65s after session launch)
+
+```
+       SID USERNAME   STATE                WAIT_CLASS       DUR_SEC  SQL_TEXT
+---------- ---------- -------------------- ---------------- -------  ------------------------------------------------
+       223 SYSTEM     WAITING              Application           82  UPDATE lock_test SET val = 99 WHERE id = 1
+        53 SYSTEM     WAITED SHORT TIME    Other                 83  SELECT SUM(slow_hash(id)) FROM big_table WHER
+```
+
+- Session A (lock holder) not visible here — its `wait_class = Idle` is filtered out
+- Session B (SID 223): `WAITING / Application` → accumulates duration, **excluded from active filter**
+- Session C (SID 53): `WAITED SHORT TIME / Other` → accumulates duration, **included in active filter**
+
+### Before/after filter counts (direct Oracle)
+
+```
+ALL_SESSIONS_COUNT
+------------------
+                 2
+
+ACTIVE_SESSIONS_COUNT
+---------------------
+                    1
+```
+
+### agent check oracle
+
+```json
+{ "metric": "oracle.all_sessions.count",    "points": [[1780314616, 3]] },
+{ "metric": "oracle.active_sessions.count", "points": [[1780314616, 1]] }
+```
+
+### Datadog API (after ~2 min ingestion)
 
 ```json
 {
   "status": "ok",
   "series": [
-    {
-      "metric": "oracle.all_sessions.count",
-      "pointlist": [[..., 2.0]]
-    },
-    {
-      "metric": "oracle.active_sessions.count",
-      "pointlist": [[..., 0.0]]
-    }
+    { "metric": "oracle.all_sessions.count",    "pointlist": [[..., 3.0]] },
+    { "metric": "oracle.active_sessions.count", "pointlist": [[..., 1.0]] }
   ]
 }
 ```
-
-> **Note on ingestion lag:** The Datadog API reflects data ~1-2 minutes after the agent submits it. Run `agent check oracle` locally first to confirm the check is producing the right values before querying the API.
 
 ## Expected vs Actual
 
 | Behavior | Expected | Actual |
 |----------|----------|--------|
-| Session B blocked on lock shows `state=WAITING` | `wait_class=Application`, `enq: TX` | ✅ Confirmed |
-| Session C active `slow_hash` shows `state=WAITED SHORT TIME` | `wait_class=Other`, duration accumulating | ✅ Confirmed — 83s at capture time |
-| `oracle.all_sessions.count` (Scenario B) | 3 (both blocked + active session) | ✅ 3 |
-| `oracle.active_sessions.count` (Scenario B) | 1 (only Session C passes `state != WAITING`) | ✅ 1 |
-| `oracle.all_sessions.count` (Scenario A, no active) | 2 | ✅ 2 |
-| `oracle.active_sessions.count` (Scenario A, no active) | 0 | ✅ 0 |
-| Both metrics visible in Datadog org via API | `status: ok`, series with correct values | ✅ Confirmed after ~2 min ingestion lag |
+| Session B `WAITING / Application` in V$SESSION | `enq: TX - row lock contention`, duration accumulating | ✅ Confirmed — 82s |
+| Session C `WAITED SHORT TIME / Other` in V$SESSION | `slow_hash` query, same `sql_exec_start` since launch | ✅ Confirmed — 83s |
+| `oracle.all_sessions.count` | 3 (Session B + C + agent session) | ✅ 3 |
+| `oracle.active_sessions.count` | 1 (only Session C passes `state != WAITING`) | ✅ 1 |
+| Metrics in Datadog org via API | `status: ok`, correct pointlist values | ✅ Confirmed |
 
 ## The Custom Query (copy-paste ready)
 
@@ -414,7 +425,7 @@ Then create a **Metric Monitor** on `oracle.active_sessions.count` with threshol
 
 ## Why the Native Monitor Cannot Do This
 
-The Long Running Query monitor reads `SYSDATE − V$SESSION.SQL_EXEC_START` and fires when that value exceeds the configured threshold. There is no parameter to exclude sessions by `wait_class` or `state`. This is confirmed by the [official conf.yaml.example](https://github.com/DataDog/datadog-agent/blob/main/cmd/agent/dist/conf.d/oracle.d/conf.yaml.example) which lists every supported parameter — no filtering option exists.
+The Long Running Query monitor reads `SYSDATE − V$SESSION.SQL_EXEC_START` and fires when that value exceeds the configured threshold. There is no parameter to exclude sessions by `wait_class` or `state`. This is confirmed by the [official conf.yaml.example](https://github.com/DataDog/datadog-agent/blob/main/cmd/agent/dist/conf.d/oracle.d/conf.yaml.example) — no filtering option exists in the full parameter list.
 
 A feature request for a native `exclude_wait_states` option on the LRQ monitor is the long-term fix.
 
@@ -423,22 +434,24 @@ A feature request for a native `exclude_wait_states` option on the LRQ monitor i
 | Column | Values | Meaning |
 |--------|--------|---------|
 | `STATE` | `WAITING` | Session is currently blocked in a wait |
-| `STATE` | `WAITED SHORT TIME` | Session was waiting briefly, now executing |
-| `STATE` | `WAITED KNOWN TIME` | Session waited a measurable duration, now executing |
-| `WAIT_CLASS` | `Application` | Blocked on row lock (enq: TX) |
+| `STATE` | `WAITED SHORT TIME` | Short wait just ended, session now executing |
+| `STATE` | `WAITED KNOWN TIME` | Measured wait just ended, session now executing |
+| `WAIT_CLASS` | `Application` | Blocked on row lock (`enq: TX - row lock contention`) |
 | `WAIT_CLASS` | `User I/O` | Waiting on disk read/write |
-| `WAIT_CLASS` | `Concurrency` | Waiting on internal latch |
-| `WAIT_CLASS` | `Idle` | Session idle (SQL*Net, DBMS_LOCK.SLEEP) |
-| `WAIT_CLASS` | `Other` | Short internal waits during active execution |
+| `WAIT_CLASS` | `Concurrency` | Waiting on internal Oracle latch |
+| `WAIT_CLASS` | `Idle` | Session idle: SQL\*Net, `DBMS_LOCK.SLEEP`, waiting for client |
+| `WAIT_CLASS` | `Other` | Short internal waits during active CPU execution |
 
 ## Gotchas
 
 | Gotcha | Detail |
 |--------|--------|
-| Image | Use `gvenzl/oracle-free:23-slim`, not `oracle-xe:21-slim` — XE crashes in minikube with ORA-00443 PMON |
-| DBMS_LOCK.SLEEP | Sessions sleeping via `DBMS_LOCK.SLEEP` appear as `state=WAITING`, `wait_class=Idle` — correctly excluded by the filter |
-| PL/SQL loops | `sql_exec_start` resets on each inner SQL statement in a loop — a looping procedure won't accumulate duration per iteration |
-| `system` user | Connects to FREEPDB1 directly — no need for `c##` common user or `dd_session` view for `V$SESSION` access |
+| Image | Use `gvenzl/oracle-free:23-slim` — `oracle-xe:21-slim` crashes in minikube with ORA-00443 PMON (shared memory) |
+| `DBMS_LOCK.SLEEP` | Puts session in `WAITING / Idle` — correctly excluded by both `wait_class != 'Idle'` and `state != 'WAITING'` |
+| PL/SQL loop | `sql_exec_start` resets on each inner SQL statement — use a single long SQL (like `slow_hash`) to accumulate duration |
+| `system` user | Connects to FREEPDB1 directly — no `c##` common user or `dd_session` view needed for `V$SESSION` access |
+| `query_activity: false` | Set to avoid ORA-00942 on `dd_session` (not created in this simple setup); custom queries are unaffected |
+| Ingestion lag | `agent check oracle` shows correct values immediately; Datadog API reflects them after ~1-2 min |
 
 ## Cleanup
 
@@ -451,5 +464,5 @@ kubectl delete namespace datadog
 ## References
 
 - [oracle.d/conf.yaml.example — full parameter list](https://github.com/DataDog/datadog-agent/blob/main/cmd/agent/dist/conf.d/oracle.d/conf.yaml.example)
-- [Oracle V$SESSION documentation](https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/V-SESSION.html)
+- [Oracle V\$SESSION documentation](https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/V-SESSION.html)
 - Related sandbox: [oracle-dbm-long-running-query-duration](../oracle-dbm-long-running-query-duration) — explains wall-clock duration vs alert window
