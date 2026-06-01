@@ -17,11 +17,14 @@ The workaround is a `custom_queries` block that reads `V$SESSION` with a `state 
 | `oracle.all_sessions.count` | None | All user sessions with `sql_exec_start > threshold` |
 | `oracle.active_sessions.count` | `state != 'WAITING'` | Only sessions not blocked in a wait state |
 
-**Validated result:**
+**Validated results (two scenarios):**
 
-With one CPU-active session and two blocked sessions (lock contention):
-- `oracle.all_sessions.count` = **2** (both blocked sessions accumulate wall-clock duration)
-- `oracle.active_sessions.count` = **0** (both correctly excluded — they are in `state = WAITING`)
+| Scenario | `oracle.all_sessions.count` | `oracle.active_sessions.count` |
+|----------|-----------------------------|-------------------------------|
+| 1 blocked waiter (>60s), 0 active | 2 | 0 |
+| 1 blocked waiter + 1 active CPU query (>60s) | 3 | 1 |
+
+Scenario B is the key proof: the filter correctly isolates the 1 actively executing session from the blocked ones.
 
 ## Environment
 
@@ -306,22 +309,37 @@ Active only (state != WAITING)                        0
 ### agent check oracle output
 
 ```bash
+AGENT_POD=$(kubectl get pod -n datadog -l app=datadog-agent -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -n datadog $AGENT_POD -c agent -- agent check oracle 2>&1 \
-  | grep -B1 -A6 "active_sessions\|all_sessions"
+  | grep -B1 -A5 "active_sessions.count\|all_sessions.count"
 ```
 
-Expected:
+**Scenario A — only blocked sessions (>60s), no active:**
 
 ```json
-{
-  "metric": "oracle.all_sessions.count",
-  "points": [[1780314144, 2]]
-},
-{
-  "metric": "oracle.active_sessions.count",
-  "points": [[1780314144, 0]]
-}
+{ "metric": "oracle.all_sessions.count",    "points": [[..., 2]] },
+{ "metric": "oracle.active_sessions.count", "points": [[..., 0]] }
 ```
+
+**Scenario B — 1 blocked + 1 actively executing (>60s) — the key proof:**
+
+```json
+{ "metric": "oracle.all_sessions.count",    "points": [[..., 3]] },
+{ "metric": "oracle.active_sessions.count", "points": [[..., 1]] }
+```
+
+Reproduce Scenario B by starting Session C (`slow_hash` on 150K rows, ~143s) alongside Sessions A and B. After 65s the check returns `all=3, active=1`.
+
+**V$SESSION at that moment:**
+
+```
+SID  USERNAME  STATE                WAIT_CLASS   DUR_SEC  SQL_TEXT
+223  SYSTEM    WAITING              Application      182  UPDATE lock_test SET val = 99 WHERE id = 1
+ 53  SYSTEM    WAITED SHORT TIME    Other             83  SELECT SUM(slow_hash(id)) FROM big_table...
+```
+
+- SID 223 `WAITING` → **excluded** from `active_sessions.count`
+- SID 53 `WAITED SHORT TIME` → **included** in `active_sessions.count`
 
 ### Datadog API query (last 10 min)
 
@@ -361,11 +379,13 @@ Expected response (after ~2 min ingestion lag):
 
 | Behavior | Expected | Actual |
 |----------|----------|--------|
-| Session B (blocked on lock) in V$SESSION | `state=WAITING`, `wait_class=Application` | ✅ Confirmed — `enq: TX - row lock contention` |
-| `oracle.all_sessions.count` after 60s | 2 (blocked sessions accumulate wall-clock duration) | ✅ 2 |
-| `oracle.active_sessions.count` after 60s | 0 (blocked sessions excluded by `state != WAITING`) | ✅ 0 |
+| Session B blocked on lock shows `state=WAITING` | `wait_class=Application`, `enq: TX` | ✅ Confirmed |
+| Session C active `slow_hash` shows `state=WAITED SHORT TIME` | `wait_class=Other`, duration accumulating | ✅ Confirmed — 83s at capture time |
+| `oracle.all_sessions.count` (Scenario B) | 3 (both blocked + active session) | ✅ 3 |
+| `oracle.active_sessions.count` (Scenario B) | 1 (only Session C passes `state != WAITING`) | ✅ 1 |
+| `oracle.all_sessions.count` (Scenario A, no active) | 2 | ✅ 2 |
+| `oracle.active_sessions.count` (Scenario A, no active) | 0 | ✅ 0 |
 | Both metrics visible in Datadog org via API | `status: ok`, series with correct values | ✅ Confirmed after ~2 min ingestion lag |
-| `agent check oracle` shows correct values locally | `all_sessions.count=2`, `active_sessions.count=0` | ✅ Confirmed immediately |
 
 ## The Custom Query (copy-paste ready)
 
