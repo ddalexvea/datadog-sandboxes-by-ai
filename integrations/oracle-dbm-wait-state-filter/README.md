@@ -32,14 +32,27 @@ With one CPU-active session and two blocked sessions (lock contention):
 
 ## Schema
 
-```
+```mermaid
 graph LR
-  A[Datadog Agent\nns: datadog] -->|Autodiscovery annotation| B[Oracle Free 23c\nns: oracle-sandbox\nFREEPDB1]
-  B --> C[V$SESSION\nstate / wait_class\nsql_exec_start]
-  C -->|all_sessions query\nno filter| D[oracle.all_sessions.count]
-  C -->|active_sessions query\nstate != WAITING| E[oracle.active_sessions.count]
-  F[Session A: CPU loop] -->|state=WAITED SHORT TIME| B
-  G[Session B: blocked UPDATE] -->|state=WAITING\nwait_class=Application| B
+  subgraph oracle-sandbox
+    B[Oracle Free 23c\nFREEPDB1]
+    SA[Session A\nlock holder\nDBMS_LOCK.SLEEP 300s]
+    SB[Session B\nblocked UPDATE\nenq: TX contention]
+    SA -->|holds row lock| B
+    SB -->|blocked waiting| B
+  end
+
+  subgraph datadog
+    A[Datadog Agent\nAutodiscovery]
+  end
+
+  B -->|V$SESSION\nsql_exec_start / state / wait_class| A
+
+  A -->|all_sessions query\nno state filter\ncount=2| D[oracle.all_sessions.count]
+  A -->|active_sessions query\nstate != WAITING\ncount=0| E[oracle.active_sessions.count]
+
+  D -->|"delta proves filter works\nall=2 vs active=0"| F[Datadog Org\nMetrics Explorer]
+  E --> F
 ```
 
 ## Quick Start
@@ -265,14 +278,94 @@ AGENT_POD=$(kubectl get pod -n datadog -l app=datadog-agent -o jsonpath='{.items
 kubectl exec -n datadog $AGENT_POD -c agent -- agent check oracle 2>&1 | grep -B1 -A8 "active_sessions\|all_sessions"
 ```
 
+## Expected Outputs
+
+### V$SESSION after 60s (direct Oracle query)
+
+```
+       SID USERNAME   STATE                WAIT_CLASS       DUR_SEC
+---------- ---------- -------------------- ---------------- ----------
+       223 SYSTEM     WAITING              Application           79
+```
+
+Session B (blocked UPDATE) shows `state = WAITING`, `wait_class = Application`, duration accumulating.
+Session A (lock holder sleeping) shows `wait_class = Idle` — filtered out by `wait_class != 'Idle'` in both queries.
+
+### Before/after filter queries (direct sqlplus)
+
+```
+LABEL                                              CNT
+-------------------------------------------------- ----
+All long-running (no filter)                          1
+
+LABEL                                              CNT
+-------------------------------------------------- ----
+Active only (state != WAITING)                        0
+```
+
+### agent check oracle output
+
+```bash
+kubectl exec -n datadog $AGENT_POD -c agent -- agent check oracle 2>&1 \
+  | grep -B1 -A6 "active_sessions\|all_sessions"
+```
+
+Expected:
+
+```json
+{
+  "metric": "oracle.all_sessions.count",
+  "points": [[1780314144, 2]]
+},
+{
+  "metric": "oracle.active_sessions.count",
+  "points": [[1780314144, 0]]
+}
+```
+
+### Datadog API query (last 10 min)
+
+```bash
+API_KEY=$(kubectl get secret datadog-keys -n default -o jsonpath='{.data.api-key}' | base64 -d)
+APP_KEY=$(kubectl get secret datadog-keys -n default -o jsonpath='{.data.app-key}' | base64 -d)
+FROM=$(($(date +%s) - 600))
+
+curl -s -G "https://api.datadoghq.com/api/v1/query" \
+  -H "DD-API-KEY: $API_KEY" -H "DD-APPLICATION-KEY: $APP_KEY" \
+  --data-urlencode "from=$FROM" \
+  --data-urlencode "to=$(date +%s)" \
+  --data-urlencode "query=oracle.all_sessions.count{*},oracle.active_sessions.count{*}"
+```
+
+Expected response (after ~2 min ingestion lag):
+
+```json
+{
+  "status": "ok",
+  "series": [
+    {
+      "metric": "oracle.all_sessions.count",
+      "pointlist": [[..., 2.0]]
+    },
+    {
+      "metric": "oracle.active_sessions.count",
+      "pointlist": [[..., 0.0]]
+    }
+  ]
+}
+```
+
+> **Note on ingestion lag:** The Datadog API reflects data ~1-2 minutes after the agent submits it. Run `agent check oracle` locally first to confirm the check is producing the right values before querying the API.
+
 ## Expected vs Actual
 
 | Behavior | Expected | Actual |
 |----------|----------|--------|
-| Session B (blocked on lock) in V$SESSION | `state=WAITING`, `wait_class=Application` | ✅ Confirmed |
-| `oracle.all_sessions.count` with blocked sessions | > 0 (counts blocked sessions) | ✅ 2 (both blocked sessions) |
-| `oracle.active_sessions.count` with `state != WAITING` filter | 0 (blocked sessions excluded) | ✅ 0 |
-| Both custom metrics emitting from agent | Visible in `agent check oracle` output | ✅ Confirmed |
+| Session B (blocked on lock) in V$SESSION | `state=WAITING`, `wait_class=Application` | ✅ Confirmed — `enq: TX - row lock contention` |
+| `oracle.all_sessions.count` after 60s | 2 (blocked sessions accumulate wall-clock duration) | ✅ 2 |
+| `oracle.active_sessions.count` after 60s | 0 (blocked sessions excluded by `state != WAITING`) | ✅ 0 |
+| Both metrics visible in Datadog org via API | `status: ok`, series with correct values | ✅ Confirmed after ~2 min ingestion lag |
+| `agent check oracle` shows correct values locally | `all_sessions.count=2`, `active_sessions.count=0` | ✅ Confirmed immediately |
 
 ## The Custom Query (copy-paste ready)
 
