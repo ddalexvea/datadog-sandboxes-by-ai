@@ -1,0 +1,23 @@
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:10.3.1
+    command: mitmdump --set confdir=/home/mitmproxy/.mitmproxy
+    volumes:
+      - mitm-ca:/home/mitmproxy/.mitmproxy
+
+  # Real Datadog Agent image -- same embedded Python, same datadog_checks.downloader /
+  # tuf modules the Windows agent.exe uses. This is what makes the reproduction exact
+  # rather than a simulation.
+  agent:
+    image: datadog/agent:7
+    entrypoint: ["sleep", "infinity"]
+    depends_on:
+      - mitmproxy
+    volumes:
+      - mitm-ca:/mitm-ca:ro
+    environment:
+      - HTTPS_PROXY=http://mitmproxy:8080
+      - HTTP_PROXY=http://mitmproxy:8080
+
+volumes:
+  mitm-ca:
