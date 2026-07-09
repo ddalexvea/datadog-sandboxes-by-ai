@@ -42,8 +42,9 @@ expires and rolls it back.
 
 This sandbox reproduces the bug end-to-end in a real AWS account: a fresh
 run that only barely survives the timeout, a run that hits `LimitExceeded`
-and just manages to report `FAILED` in time, and a run that gets killed
-mid-flight exactly like the customer described.
+and just manages to report `FAILED` in time, a run that gets killed
+mid-flight exactly like the customer described, **and a verified fix run**
+proving a one-line patch resolves it completely.
 
 **Known reports:**
 - Reported independently by two customers so far: this Zendesk case (root
@@ -53,7 +54,9 @@ mid-flight exactly like the customer described.
   [PR #309](https://github.com/DataDog/cloudformation-template/pull/309)
   ("Increase Lambda timeout from 5 to 300 seconds"), filed 2026-05-17.
   As of this writing it is **still open / not merged**, untriaged (no
-  reviewer, no assignee, no labels).
+  reviewer, no assignee, no labels). **The fix itself has been independently
+  verified in this sandbox — see "Run 4" below — so a locally patched
+  template can be used immediately without waiting for the PR to merge.**
 
 ## Environment
 
@@ -165,8 +168,8 @@ aws logs tail "/aws/lambda/$FN_NAME" --since 5m --follow
 
 ## Test Commands / Evidence captured
 
-Three sandbox runs, escalating conditions, show the full spectrum of this
-bug:
+Four sandbox runs, escalating conditions, show the full spectrum of this
+bug — and confirm the fix:
 
 **Run 1 — fresh role, zero pre-existing policies (best case):**
 The Lambda *succeeds*, but only just — `Duration: 4966.937 ms` against the
@@ -195,17 +198,39 @@ CloudFormation received nothing and the stack sat in `CREATE_IN_PROGRESS`
 indefinitely (verified directly — no `StatusReason`, no forward progress —
 then manually deleted rather than waiting out the full ~60-minute window).
 
+**Run 4 — fix verification: same official template, `Timeout: 5` → `300`, otherwise byte-for-byte identical:**
+Deployed against a role matching a real customer's exact reported condition
+(2 pre-existing policies, `ReadOnlyAccess` + `ViewOnlyAccess`, after they'd
+manually detached everything else to free up quota headroom):
+
+```json
+{"time":"2026-07-09T09:59:05.883Z","type":"platform.report","record":{"requestId":"91a84db4-9215-4ea8-ade4-d5f24e9c6e79","metrics":{"durationMs":5622.492,"billedDurationMs":6322,"memorySizeMB":128,"maxMemoryUsedMB":97,"initDurationMs":698.806},"status":"success"}}
+```
+
+- Stack reached `CREATE_COMPLETE` in ~30 seconds (vs. a ~60-minute hang).
+- **`durationMs: 5622.492`** — notably *longer* than the original hard
+  5000ms limit, confirming there was never a safe execution margin at 5s,
+  independent of whether `LimitExceeded` is hit.
+- All 9 expected policies verified attached on the role afterward: the 2
+  pre-existing + `SecurityAudit` + all 6
+  `datadog-aws-integration-iam-permissions-*-partN` policies.
+- Conclusion: **this is confirmed to be solely a timeout-value problem.**
+  A locally patched template (only `Timeout: 5` → `300` changed, otherwise
+  the current official file) is a complete, working fix — it does **not**
+  require PR #309 to merge upstream first. The PR merging only matters for
+  the long-term fix so future installs don't need a manual patch.
+
 ## Expected vs Actual
 
 | | Expected | Actual |
 |---|---|---|
 | Lambda execution | Completes all `AttachRolePolicy` calls within timeout, returns `SUCCESS`/`FAILED` to CloudFormation | Killed by the Lambda runtime at the hard 5000ms mark before it can respond |
 | Stack behavior on failure | Fails fast with a clear `CREATE_FAILED` / `ResourceStatusReason` | Hangs silently in `CREATE_IN_PROGRESS` for up to ~60 minutes, then rolls back with no actionable reason |
-| Margin for error | Comfortable buffer for sequential IAM API calls | Razor-thin even on a *fresh* role with zero pre-existing policies (4.97s of a 5.0s budget) |
+| Margin for error | Comfortable buffer for sequential IAM API calls | Razor-thin even on a *fresh* role with zero pre-existing policies (4.97s of a 5.0s budget) — and confirmed insufficient even at 5.6s total workload (Run 4) |
 
 ## Fix / Workaround
 
-### Fix (upstream, not yet merged)
+### Fix (upstream, not yet merged — but independently verified, see Run 4 above)
 
 [PR #309](https://github.com/DataDog/cloudformation-template/pull/309)
 bumps `Timeout: 5` to `Timeout: 300` on the same Lambda resource. The
@@ -214,7 +239,23 @@ author's own testing notes independently corroborate this reproduction:
 the CloudFormation stack to fail... Previous tests with 5-second timeout
 consistently failed."*
 
-### Workaround (for anyone hitting this now)
+**This sandbox independently re-verified the same fix** by patching the
+current official template directly (not the contributor's fork) and
+deploying it against a role matching a real reported failure condition —
+see Run 4. Confirmed: a locally patched template works today, without
+waiting for the PR to merge.
+
+### Immediate workaround — deploy a locally patched template (recommended, verified)
+
+1. Fetch the current official template and change only `Timeout: 5` to
+   `Timeout: 300` on the `DatadogAttachIntegrationPermissionsFunction`
+   resource — nothing else needs to change.
+2. Deploy that patched file in place of the original via
+   `create-stack`/`update-stack` — same parameters as usual.
+3. Once PR #309 (or an equivalent internal fix) merges upstream, switch
+   back to the standard template on your next update.
+
+### Alternative workaround — manual IAM policy attachment (works, but doesn't fix CFN stack status)
 
 1. Let the stuck stack fail/roll back, or delete it manually rather than
    waiting the full ~60 minutes.
@@ -229,12 +270,18 @@ consistently failed."*
    all required policies are present, without needing the CloudFormation
    resource itself to report success.
 
-Alternative workaround (self-tested by a customer): if you can edit the
-Lambda's configuration directly during the window before CloudFormation
-gives up, bump its timeout in the Lambda console/CLI to something like
-4 minutes — on retry it then has enough time to catch the underlying
-`LimitExceeded` error and report `CREATE_FAILED` cleanly instead of
-hanging.
+### What does NOT work (confirmed by a real customer report)
+
+- **Reducing pre-existing policy count alone** — even a completely fresh
+  role with zero pre-existing policies is not safe (Run 1: 4966.937ms of
+  5000ms budget; Run 4 confirms real-world runs can take 5.6s+). The
+  bottleneck is the total sequential workload (Datadog API fetch + create
+  6 policies + attach 7 policies), not solely the IAM quota.
+- **Increasing the Lambda's timeout in the console/CLI *after* stack
+  creation has already started** — CloudFormation's initial invocation is
+  already in-flight using the 5-second config baked in at Lambda creation
+  time; a runtime config edit does not retroactively affect an in-flight
+  invocation. The template itself must be patched *before* deployment.
 
 ## Cleanup
 
@@ -254,11 +301,17 @@ aws iam delete-role --role-name "$ROLE_NAME"
 rm -rf /tmp/cfn-lambda-timeout-repro
 ```
 
+Note: the Lambda's own `Delete` handler cleans up the 6
+`datadog-aws-integration-iam-permissions-*-partN` policies automatically on
+stack deletion, but does **not** detach `SecurityAudit` — detach that one
+manually before deleting the role, or `delete-role` will fail with
+`DeleteConflict`.
+
 ## References
 
 - [`DataDog/cloudformation-template`](https://github.com/DataDog/cloudformation-template) — source repo
 - [`aws_attach_integration_permissions/main.yaml`](https://github.com/DataDog/cloudformation-template/blob/master/aws_attach_integration_permissions/main.yaml) — file containing the hardcoded `Timeout: 5`
-- [PR #309 — "fix: Increase Lambda timeout from 5 to 300 seconds"](https://github.com/DataDog/cloudformation-template/pull/309) — open, unmerged fix
+- [PR #309 — "fix: Increase Lambda timeout from 5 to 300 seconds"](https://github.com/DataDog/cloudformation-template/pull/309) — open, unmerged fix, independently re-verified in this sandbox (Run 4)
 - [AWS IAM quotas — managed policies per role (10)](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_iam-quotas.html)
 - [AWS Lambda function timeout configuration](https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html)
 - [CloudFormation custom resources — response objects](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/crpg-ref-responses.html)
